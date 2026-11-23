@@ -1,0 +1,2 @@
+PySide6-WebEngine>=6.12,<7
+keyring>=25,<26

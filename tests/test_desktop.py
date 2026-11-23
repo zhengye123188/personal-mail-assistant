@@ -1,0 +1,798 @@
+import json
+import os
+import tempfile
+import threading
+import time
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QPushButton
+
+from maildesk.demo import DemoVault
+from maildesk.models import InboxCursor, MailBody, MailPage, PAGE_SIZE
+from maildesk.reply_ai import ReplyAI
+from maildesk.service import MailService
+from maildesk.ui import MainWindow
+from tests.mail_fixtures import ACCOUNTS, FixtureClient, PNG
+
+
+class DelayedInbox(FixtureClient):
+    def __init__(self):
+        super().__init__()
+        self.qq_started = threading.Event()
+        self.release_qq = threading.Event()
+        self.unavailable = set()
+
+    def list_messages(self, account, secret, before_uid=None):
+        if account.address in self.unavailable:
+            raise ConnectionError("模拟连接失败")
+        return super().list_messages(account, secret, before_uid)
+
+    def read_body(self, account, secret, item):
+        if account.provider == "qq":
+            self.qq_started.set()
+            if not self.release_qq.wait(4):
+                raise TimeoutError("模拟请求超时")
+        return super().read_body(account, secret, item)
+
+    def scan_arrivals(self, account, secret, validity, after_uid):
+        if account.address in self.unavailable:
+            raise ConnectionError("模拟提醒检查失败")
+        return super().scan_arrivals(account, secret, validity, after_uid)
+
+
+class DesktopFlowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.client = DelayedInbox()
+        self.service = MailService(Path(directory.name) / "accounts.db", self.client, DemoVault())
+        self.window = MainWindow(self.service, demo=True, simulate_arrival=self.client.simulate_arrival)
+        self.window.show()
+
+    def tearDown(self):
+        self.client.release_qq.set()
+        self.wait_until(lambda: not self.window.jobs)
+        self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+
+    def wait_until(self, predicate):
+        end = time.monotonic() + 4
+        while time.monotonic() < end:
+            self.app.processEvents()
+            if predicate():
+                return
+            QTest.qWait(10)
+        self.fail("操作未在预期时间内完成")
+
+    def bind_in_ui(self, account):
+        self.window.findChild(QPushButton, "bindButton").click()
+        dialog = self.window.binding
+        dialog.provider.setCurrentIndex(dialog.provider.findData(account.provider))
+        dialog.address.setText(account.address)
+        dialog.secret.setText("offline-test-code")
+        dialog.submit.click()
+        self.wait_until(lambda: self.window.binding is None and self.window.mail_list.count() == 3)
+
+    def show_mailbox(self, kind, address=None):
+        from maildesk.ui import NAV_KIND, USER_ROLE
+
+        nav = self.window.account_list
+        for row in range(nav.count()):
+            item = nav.item(row)
+            if item.data(NAV_KIND) == kind and item.data(USER_ROLE) == address:
+                nav.setCurrentItem(item)
+                return
+        self.fail(f"侧栏缺少邮箱 {kind} {address}")
+
+    def click_message(self, row):
+        listing = self.window.mail_list
+        position = listing.visualItemRect(listing.item(row)).center()
+        QTest.mouseClick(listing.viewport(), Qt.MouseButton.LeftButton, pos=position)
+
+    def open_first_reply(self, account):
+        self.show_mailbox("account", account.address)
+        self.wait_until(lambda: self.window.mail_list.count() == 3 and not self.window.jobs)
+        self.click_message(0)
+        self.wait_until(lambda: self.window.reply_button.isEnabled() and not self.window.jobs)
+        item = self.window.mail_list.currentItem().data(Qt.ItemDataRole.UserRole)
+        self.assertEqual(item.account, account.address)
+        key = (item.account, item.validity, item.uid)
+        self.window.reply_button.click()
+        self.wait_until(lambda: key in self.window.reply_drafts and self.window.reply_drafts[key].dialog.isVisible())
+        return key, self.window.reply_drafts[key].dialog
+
+    def set_ai_enabled(self, enabled):
+        self.window.ai_settings_button.click()
+        dialog = self.window.model_settings
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.enabled.isChecked(), not enabled)
+        dialog.enabled.setChecked(enabled)
+        dialog.buttons.button(QDialogButtonBox.StandardButton.Save).click()
+        self.wait_until(lambda: self.window.model_settings is None)
+
+    def open_demo_chat(self):
+        self.client.release_qq.set()
+        for account in ACCOUNTS:
+            self.bind_in_ui(account)
+        self.show_mailbox("account", ACCOUNTS[0].address)
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertFalse(self.window.chat_button.isVisible())
+        self.set_ai_enabled(True)
+        self.assertTrue(self.window.chat_button.isVisible())
+        self.window.chat_button.click()
+        chat = self.window.chat_dialog
+        self.assertTrue(chat.isVisible())
+        return chat
+
+    def ask_chat(self, chat, question):
+        previous = len(chat.history)
+        chat.input.setPlainText(question)
+        chat.send_button.click()
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(len(chat.history), previous + 1, chat.status.text())
+        return chat.history[-1]
+
+    def test_quitting_with_a_hidden_draft_can_resume_or_discard_it(self):
+        qq = ACCOUNTS[0]
+        self.client.release_qq.set()
+        self.bind_in_ui(qq)
+        _, dialog = self.open_first_reply(qq)
+        dialog.draft.setPlainText("尚未发送的回复")
+        dialog.close()
+        self.assertFalse(self.window.close())
+        prompt = self.window.quit_prompt
+        self.assertTrue(prompt.isVisible())
+        prompt.defaultButton().click()
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.draft.toPlainText(), "尚未发送的回复")
+        self.assertFalse(self.window.close())
+        prompt = self.window.quit_prompt
+        next(button for button in prompt.buttons() if button.text() == "放弃草稿并退出").click()
+        self.assertFalse(self.window.isVisible())
+        self.assertFalse(dialog.isVisible())
+        self.assertFalse(self.window.reply_drafts)
+        self.assertFalse(self.client.sent_replies)
+
+    def test_manual_reply_keeps_separate_drafts_for_same_uid_and_sends_from_original_account(self):
+        self.client.release_qq.set()
+        qq, netease = ACCOUNTS
+        with patch("maildesk.reply_ai._request") as cloud, patch("maildesk.reply_ai.DemoReplyAI.generate") as demo:
+            for account in ACCOUNTS:
+                self.bind_in_ui(account)
+            first_key, first = self.open_first_reply(qq)
+            self.assertFalse(first.generate_button.isVisible())
+            first.draft.setPlainText("周五我会提前到阅览室。")
+            first.close()
+
+            second_key, second = self.open_first_reply(netease)
+            self.assertEqual(first_key[1:], second_key[1:])
+            self.assertEqual(second.draft.toPlainText(), "")
+            second.draft.setPlainText("评审会议的时间收到了。")
+            second.close()
+
+            _, first = self.open_first_reply(qq)
+            self.assertEqual(first.draft.toPlainText(), "周五我会提前到阅览室。")
+            first.close()
+            _, second = self.open_first_reply(netease)
+            self.assertEqual(second.draft.toPlainText(), "评审会议的时间收到了。")
+            self.assertEqual(self.client.sent_replies, [])
+            second.draft.setPlainText("周三下午两点见。")
+            self.show_mailbox("account", qq.address)
+            self.wait_until(lambda: not self.window.jobs)
+            second.send_button.click()
+            self.wait_until(lambda: len(self.client.sent_replies) == 1 and not self.window.jobs)
+            sent = self.client.sent_replies[0]
+            self.assertEqual(sent["From"], netease.address)
+            self.assertEqual(sent["To"], "reviewer@example.org")
+            self.assertEqual(sent.get_content().strip(), "周三下午两点见。")
+            self.assertIn(first_key, self.window.reply_drafts)
+            cloud.assert_not_called()
+            demo.assert_not_called()
+
+    def test_toggle_ai_in_settings_updates_open_draft_and_generated_text_can_be_sent_manually(self):
+        account = ACCOUNTS[1]
+        self.bind_in_ui(account)
+        _, composer = self.open_first_reply(account)
+        composer.draft.setPlainText("先记下我的回复")
+        self.assertFalse(composer.generate_button.isVisible())
+        with patch("maildesk.reply_ai._request") as cloud:
+            self.set_ai_enabled(True)
+            self.assertTrue(composer.generate_button.isVisible())
+            self.assertEqual(composer.draft.toPlainText(), "先记下我的回复")
+            composer.instructions.setPlainText("请对方补充信息")
+            composer.generate_button.click()
+            self.wait_until(lambda: composer.draft.toPlainText() != "先记下我的回复" and not self.window.jobs)
+            generated = composer.draft.toPlainText()
+            self.assertTrue(generated.strip())
+            self.assertEqual(self.client.sent_replies, [])
+            self.set_ai_enabled(False)
+            self.assertFalse(composer.generate_button.isVisible())
+            self.assertFalse(composer.instructions.isVisible())
+            self.assertEqual(composer.draft.toPlainText(), generated)
+            composer.draft.setPlainText("请补充下周的会议议程，谢谢。")
+            self.assertTrue(composer.send_button.isEnabled())
+            composer.send_button.click()
+            self.wait_until(lambda: len(self.client.sent_replies) == 1 and not self.window.jobs)
+            self.assertEqual(self.client.sent_replies[0].get_content().strip(), "请补充下周的会议议程，谢谢。")
+            cloud.assert_not_called()
+
+    def test_chinese_instructions_draft_and_shorten_an_english_reply_from_the_reader(self):
+        account = ACCOUNTS[1]
+        self.bind_in_ui(account)
+        self.set_ai_enabled(True)
+        original = ("Hi Chen, could you confirm receipt of the agenda for our next meeting?\n\n"
+                    "-----Original Message-----\n" + "这里是之前用中文讨论的会议安排。\n" * 12)
+        demo_content = self.client.read_content
+
+        def read_english(*args):
+            return replace(demo_content(*args), text=original)
+
+        with patch.object(self.client, "read_content", side_effect=read_english):
+            _, dialog = self.open_first_reply(account)
+            self.assertIn("could you confirm receipt", self.window.body.toPlainText())
+            dialog.instructions.setPlainText("确认收到")
+            dialog.generate_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            first = dialog.draft.toPlainText()
+            self.assertIn("received", first.lower(), dialog.status.text())
+            self.assertNotRegex(first, r"[\u3400-\u9fff]")
+
+            dialog.instructions.setPlainText("再简短一点")
+            dialog.generate_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            revised = dialog.draft.toPlainText()
+            self.assertIn("received", revised.lower(), dialog.status.text())
+            self.assertNotRegex(revised, r"[\u3400-\u9fff]")
+            self.assertLess(len(revised), len(first))
+            self.assertFalse(self.client.sent_replies)
+            dialog.draft.clear()
+            dialog.close()
+
+    def test_multiline_reply_requirements_reach_provider_from_reopened_composer(self):
+        account = ACCOUNTS[1]
+        self.bind_in_ui(account)
+        model = ReplyAI(provider="deepseek", key_lookup=lambda: "test-only")
+        requirements = "先谢谢对方邀请。\n周三下午不方便，问问能不能改到周五上午。\n语气礼貌一点，两三句话。"
+        reply = "谢谢您的邀请！周三下午我不方便参加，能否改到周五上午？"
+        answer = {"kind": "draft", "answer": "已按要求写好。", "draft": reply}
+        with patch("maildesk.ui.selected_model", return_value=model), patch(
+                "maildesk.reply_ai._request", return_value={"choices": [{"message": {"content": json.dumps(answer)}}]}
+        ) as provider:
+            self.set_ai_enabled(True)
+            _, composer = self.open_first_reply(account)
+            composer.instructions.setPlainText(requirements)
+            composer.close()
+            _, composer = self.open_first_reply(account)
+            provider.assert_not_called()
+            self.assertEqual(composer.instructions.toPlainText(), requirements)
+            composer.generate_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(composer.draft.toPlainText(), reply)
+            self.assertEqual(provider.call_count, 1)
+            messages = provider.call_args.args[1]["messages"]
+            self.assertEqual(json.loads(messages[-1]["content"])["本次要求"], requirements)
+            self.assertIn("评审", messages[-1]["content"])
+            self.assertEqual(self.client.sent_replies, [])
+            composer.draft.clear()
+            composer.close()
+
+    def test_tab_accepts_the_selected_mails_reply_suggestion_without_drafting(self):
+        qq, netease = ACCOUNTS
+        self.client.release_qq.set()
+        for account in ACCOUNTS:
+            self.bind_in_ui(account)
+        model = ReplyAI(provider="deepseek", key_lookup=lambda: "test-only")
+        result = {"kind": "draft", "answer": "已拟好。", "draft": "你好，请问评审将在哪里举行？"}
+        response = {"choices": [{"message": {"content": json.dumps(result)}}]}
+        with patch("maildesk.ui.selected_model", return_value=model), \
+                patch("maildesk.reply_ai._request", return_value=response) as provider:
+            self.set_ai_enabled(True)
+
+            def open_and_complete(account):
+                _, dialog = self.open_first_reply(account)
+                self.assertEqual(dialog.instructions.toPlainText(), "")
+                self.assertFalse(dialog.generate_button.isEnabled())
+                hint = dialog.instructions.placeholderText()
+                dialog.instructions.setFocus()
+                QTest.keyClick(dialog.instructions, Qt.Key.Key_Tab)
+                self.assertEqual(dialog.instructions.toPlainText(), hint)
+                self.assertTrue(dialog.generate_button.isEnabled())
+                self.assertEqual(dialog.draft.toPlainText(), "")
+                self.assertFalse(dialog.assistant_history)
+                self.assertFalse(self.window.jobs)
+                provider.assert_not_called()
+                return dialog, dialog.instructions.toPlainText()
+
+            first, qq_suggestion = open_and_complete(qq)
+            self.assertRegex(qq_suggestion, "提前|十分钟|布置|阅览室")
+            handwritten = "我的交通时间还没确定，请问最晚几点到？"
+            first.instructions.setPlainText(handwritten)
+            first.close()
+
+            second, netease_suggestion = open_and_complete(netease)
+            self.assertRegex(netease_suggestion, "周三|两点|2点")
+            self.assertNotEqual(qq_suggestion, netease_suggestion)
+            second.generate_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(second.draft.toPlainText(), result["draft"])
+            self.assertEqual(provider.call_count, 1)
+            context = json.loads(provider.call_args.args[1]["messages"][-1]["content"])
+            self.assertEqual(context["本次要求"], netease_suggestion)
+            self.assertFalse(self.client.sent_replies)
+            second.draft.clear()
+            second.close()
+
+            _, first = self.open_first_reply(qq)
+            self.assertEqual(first.instructions.toPlainText(), handwritten)
+            self.assertEqual(first.draft.toPlainText(), "")
+            first.instructions.clear()
+            first.close()
+
+    def test_mail_chat_followup_opens_reply_with_original_context_and_revises_manual_edits(self):
+        qq, netease = ACCOUNTS
+        chat = self.open_demo_chat()
+        listed = self.ask_chat(chat, "列出两个邮箱最近的邮件")
+        self.assertEqual({m.account for m in listed.sources}, {qq.address, netease.address})
+        chosen = listed.sources[1]
+        self.assertEqual(chosen.account, netease.address)
+        key = (chosen.account, chosen.validity, chosen.uid)
+        draft = self.ask_chat(chat, "帮我回第二封")
+        self.assertEqual(draft.draft_item, chosen)
+        self.assertTrue(draft.draft_text)
+        self.assertEqual(self.window.active_address, qq.address)
+        chat.findChild(QPushButton, "chatCompose").click()
+        self.wait_until(lambda: key in self.window.reply_drafts and not self.window.jobs)
+        dialog = self.window.reply_drafts[key].dialog
+        self.assertTrue(dialog.isVisible())
+        header_values = [f.text() for f in dialog.findChildren(QLineEdit) if f.property("headerValue")]
+        self.assertIn(netease.address, header_values)
+        self.assertIn("reviewer@example.org", header_values)
+        self.assertEqual(dialog.draft.toPlainText(), draft.draft_text)
+        self.assertEqual([t.question for t in dialog.assistant_history], [draft.question])
+        self.assertNotIn(qq.address, dialog.assistant_transcript.toPlainText())
+
+        def submit_instruction(button, question):
+            previous = len(dialog.assistant_history)
+            dialog.instructions.setPlainText(question)
+            button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(len(dialog.assistant_history), previous + 1, dialog.status.text())
+            return dialog.assistant_history[-1]
+
+        answer = submit_instruction(dialog.ask_button, "对方希望我确认什么？")
+        self.assertIn("评审", answer.answer)
+        self.assertFalse(answer.draft)
+        self.assertEqual(dialog.draft.toPlainText(), draft.draft_text)
+        generated = submit_instruction(dialog.generate_button, "帮我写一封婉拒的回复")
+        self.assertIn("不方便", generated.draft)
+        self.assertEqual(dialog.draft.toPlainText(), generated.draft)
+        edited = "你好，\n\n谢谢你的来信。周四上午十点我可以参加。请带上蓝色样稿。"
+        dialog.draft.setPlainText(edited)
+        revised = submit_instruction(dialog.generate_button, "把这段回复改短一点")
+        self.assertIn("蓝色样稿", revised.draft)
+        self.assertLess(len(revised.draft), len(edited))
+        self.assertEqual(dialog.draft.toPlainText(), revised.draft)
+        self.assertTrue(dialog.send_button.isEnabled())
+        self.assertFalse(self.client.sent_replies)
+        self.assertTrue(next(m for m in self.service.list_messages(netease).items if m.uid == chosen.uid).unread)
+        dialog.draft.clear()
+        dialog.close()
+
+    def test_opening_two_draft_cards_during_fetch_uses_the_latest_choice(self):
+        chat = self.open_demo_chat()
+        self.ask_chat(chat, "最近有哪些邮件需要回复？")
+        first = self.ask_chat(chat, "帮我回第二封")
+        latest = self.ask_chat(chat, "再简短一点")
+        self.assertNotEqual(first.draft_text, latest.draft_text)
+        pending = []
+        with patch.object(self.window, "_run", side_effect=lambda work, done: pending.append((work, done))):
+            cards = chat.findChildren(QPushButton, "chatCompose")
+            cards[0].click()
+            cards[1].click()
+        self.assertEqual(len(pending), 2)
+        for work, done in reversed(pending):
+            done(work(), None)
+        self.assertEqual(len(self.window.reply_drafts), 1)
+        dialog = next(iter(self.window.reply_drafts.values())).dialog
+        self.assertEqual(dialog.draft.toPlainText(), latest.draft_text)
+        self.assertEqual(dialog.assistant_history[-1].question, latest.question)
+        self.assertFalse(self.client.sent_replies)
+        dialog.draft.clear()
+        dialog.close()
+
+    def test_chat_source_opens_cross_account_mail_beyond_first_page(self):
+        qq, netease = ACCOUNTS
+        chat = self.open_demo_chat()
+        for _ in range(PAGE_SIZE):
+            self.client.simulate_arrival(netease)
+        result = self.ask_chat(chat, "关于校样的邮件有哪些？")
+        self.assertEqual(len(result.sources), 1, result.answer)
+        target = result.sources[0]
+        self.assertEqual((target.account, target.subject), (netease.address, "校样核对"))
+        self.assertNotIn(target.uid, {m.uid for m in self.service.list_messages(netease).items})
+        qq_twin = next(m for m in self.service.list_messages(qq).items if m.uid == target.uid)
+        self.assertTrue(qq_twin.unread and target.unread)
+        with patch.object(self.client, "mark_read", wraps=self.client.mark_read) as mark:
+            chat.findChild(QPushButton, "chatSource").click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertFalse(chat.isVisible())
+            self.assertEqual(self.window.active_address, netease.address)
+            selected = self.window.mail_list.currentItem().data(Qt.ItemDataRole.UserRole)
+            self.assertEqual((selected.account, selected.validity, selected.uid),
+                             (target.account, target.validity, target.uid))
+            self.assertIn("第二段里的作品名称", self.window.body.toPlainText())
+            self.assertIn(netease.address, self.window.meta.text())
+            self.assertTrue(self.window.older_button.isVisible())
+            mark.assert_called_once()
+            self.assertEqual(mark.call_args.args[0], netease)
+            self.assertEqual(mark.call_args.args[2].uid, target.uid)
+        self.assertTrue(next(m for m in self.service.list_messages(qq).items if m.uid == target.uid).unread)
+        self.assertFalse(self.client.sent_replies)
+
+    def test_external_images_load_on_open_and_late_download_stays_with_its_message(self):
+        self.client.release_qq.set()
+        qq, netease = ACCOUNTS
+        for account in (qq, netease):
+            self.bind_in_ui(account)
+        url = "https://images.example.org/meeting.png"
+        picture = PNG
+
+        def content(account, secret, item):
+            title = "会议安排" if account == qq else "另一封邮件"
+            return MailBody(title, f'<p>{title}</p><img src="{url}" alt="路线图">')
+
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def fetch(urls, *, cancelled):
+            if started.is_set():
+                return {}
+            started.set()
+            release.wait(3)
+            finished.set()
+            return {url: picture}
+
+        with patch.object(self.client, "read_content", side_effect=content), \
+                patch("maildesk.ui.download_images", side_effect=fetch) as download:
+            self.show_mailbox("account", qq.address)
+            self.wait_until(lambda: self.window.mail_list.count() == 3)
+            download.assert_not_called()
+            self.click_message(0)
+            self.wait_until(started.is_set)
+            self.assertIn("会议安排", self.window.body.toPlainText())
+            self.assertFalse(finished.is_set())
+            self.show_mailbox("account", netease.address)
+            self.wait_until(lambda: self.window.mail_list.count() == 3)
+            self.click_message(0)
+            self.wait_until(lambda: "另一封邮件" in self.window.body.toPlainText())
+            self.assertTrue(download.call_args_list[0].kwargs["cancelled"]())
+            release.set()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(download.call_count, 2)
+            self.assertEqual(self.window.body.remote_urls, (url,))
+            self.assertTrue(self.window.reader.load_images.isVisible())
+            self.assertIn("另一封邮件", self.window.body.toPlainText())
+
+    def test_all_image_batches_run_automatically_and_retry_only_failed_sources(self):
+        qq = ACCOUNTS[0]
+        self.bind_in_ui(qq)
+        urls = [f"https://images.example.org/map-{i}.png" for i in range(5)]
+        picture = PNG
+        tags = "".join(f'<img src="{url}" alt="路线图">' for url in [*urls, urls[0]])
+        content = MailBody("会议地点", "<p>会议地点</p>" + tags)
+        failed = {urls[0], urls[2]}
+
+        def fetch(sources, *, cancelled):
+            return {source: picture for source in sources if source not in failed}
+
+        with patch("maildesk.ui.IMAGE_BATCH_SIZE", 2), patch.object(self.client, "read_content", return_value=content), \
+                patch("maildesk.ui.download_images", side_effect=fetch) as download:
+            self.click_message(0)
+            self.wait_until(lambda: download.call_count >= 3 and not self.window.jobs)
+            batches = [list(call.args[0]) for call in download.call_args_list]
+            self.assertEqual(batches, [urls[:2], urls[2:4], urls[4:]])
+            self.assertEqual(set(self.window.body.remote_urls), failed)
+            self.assertTrue(self.window.reader.load_images.isVisible())
+            self.assertIn("会议地点", self.window.body.toPlainText())
+
+            failed.clear()
+            self.window.reader.load_images.click()
+            self.wait_until(lambda: download.call_count >= 4 and not self.window.jobs)
+            self.assertFalse(self.window.reader.image_notice.isVisible())
+            self.assertIn("会议地点", self.window.body.toPlainText())
+            self.assertFalse(self.window.body.remote_urls)
+            self.assertEqual(download.call_count, 4)
+            self.assertEqual(tuple(download.call_args.args[0]), (urls[0], urls[2]))
+
+    def test_bind_switch_and_read_same_uid_while_old_body_is_still_loading(self):
+        qq, netease = ACCOUNTS
+        self.bind_in_ui(qq)
+        self.bind_in_ui(netease)
+        self.assertEqual(self.service.accounts(), [qq, netease])
+        self.show_mailbox("account", qq.address)
+        self.wait_until(lambda: self.window.mail_list.count() == 3)
+        self.window.mail_list.setCurrentRow(0)
+        self.wait_until(self.client.qq_started.is_set)
+        qq_item = self.window.mail_list.currentItem().data(Qt.ItemDataRole.UserRole)
+
+        self.show_mailbox("account", netease.address)
+        self.wait_until(lambda: self.window.mail_list.count() == 3)
+        self.window.mail_list.setCurrentRow(0)
+        self.wait_until(lambda: "设计评审" in self.window.body.toPlainText())
+        netease_item = self.window.mail_list.currentItem().data(Qt.ItemDataRole.UserRole)
+        self.assertEqual(qq_item.uid, netease_item.uid)
+        self.client.release_qq.set()
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertIn(netease.address, self.window.meta.text())
+        self.assertIn("设计评审", self.window.body.toPlainText())
+        self.assertFalse(self.service.list_messages(netease).items[0].unread)
+        self.assertTrue(self.service.list_messages(qq).items[0].unread)
+
+        self.show_mailbox("all")
+        self.wait_until(lambda: self.window.mail_list.count() == 6)
+        self.window.mail_list.setCurrentRow(0)
+        self.wait_until(lambda: "阅览室" in self.window.body.toPlainText())
+        self.assertIn(qq.address, self.window.meta.text())
+
+    def test_combined_inbox_can_still_read_when_another_account_fails(self):
+        qq, netease = ACCOUNTS
+        self.bind_in_ui(qq)
+        self.bind_in_ui(netease)
+        self.client.unavailable.add(qq.address)
+        self.show_mailbox("all")
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(self.window.mail_list.count(), 3)
+        self.assertIn(qq.address, self.window.notice_label.text())
+        self.window.mail_list.setCurrentRow(0)
+        self.wait_until(lambda: "设计评审" in self.window.body.toPlainText())
+        self.client.unavailable.clear()
+        self.window.retry_button.click()
+        self.wait_until(lambda: self.window.mail_list.count() == 6)
+
+    def test_date_order_pagination_and_refresh_returns_to_newest(self):
+        account = ACCOUNTS[0]
+        self.bind_in_ui(account)
+        template = self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole)
+        uids = tuple(range(1, PAGE_SIZE + 2))  # Low UIDs have the newest dates.
+        items = [replace(template, uid=uid, timestamp=template.timestamp - uid * 86400) for uid in uids]
+        cursor = InboxCursor(account.address, template.validity, uids, PAGE_SIZE)
+        first = MailPage(items[:PAGE_SIZE], items[PAGE_SIZE - 1].uid, cursor)
+        last = MailPage(items[PAGE_SIZE:], None)
+        with patch.object(self.client, "list_messages", side_effect=[first, last, first]) as fetch:
+            self.window.refresh_button.click()
+            self.wait_until(lambda: self.window.mail_list.count() == PAGE_SIZE)
+            bar = self.window.mail_list.verticalScrollBar()
+            self.wait_until(lambda: bar.maximum() > 0)
+            bar.setValue(bar.maximum())
+            self.window.older_button.click()
+            self.wait_until(lambda: self.window.mail_list.count() == len(items))
+            self.assertEqual(fetch.call_args.args[-1], cursor)
+            self.assertFalse(self.window.older_button.isVisible())
+            self.assertGreater(bar.value(), 0)
+            self.assertEqual([self.window.mail_list.item(i).data(Qt.ItemDataRole.UserRole).uid
+                              for i in range(len(items))], list(uids))
+            self.window.refresh_button.click()
+            self.wait_until(lambda: self.window.mail_list.count() == PAGE_SIZE)
+            self.assertEqual(bar.value(), 0)
+            self.assertEqual(self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole).uid, 1)
+
+    def test_search_and_mailbox_filters_keep_reader_in_sync(self):
+        self.client.release_qq.set()
+        for account in ACCOUNTS:
+            self.bind_in_ui(account)
+        self.show_mailbox("flagged")
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(self.window.mail_list.count(), 1)
+        self.window.next_button.click()
+        self.wait_until(lambda: "评审" in self.window.body.toPlainText())
+        self.wait_until(lambda: not self.window.jobs)
+        self.window.search.setText("没有这封信")
+        self.assertEqual(self.window.mail_list.count(), 0)
+        self.assertEqual(self.window.body.toPlainText(), "")
+        self.assertFalse(self.window.copy_button.isEnabled())
+        self.window.search.clear()
+        self.show_mailbox("unread")
+        self.assertEqual(self.window.mail_list.count(), 3)
+        self.window.search.setText("阅览室")
+        self.assertEqual(self.window.mail_list.count(), 1)
+        self.assertIn("阅览室", self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole).preview)
+        self.window._toggle_sidebar()
+        self.assertTrue(self.window.sidebar.isHidden())
+        self.window.show_sidebar.click()
+        self.assertFalse(self.window.sidebar.isHidden())
+
+    def test_unread_click_updates_count_and_keeps_body_after_row_is_removed(self):
+        from maildesk.ui import NAV_COUNT
+
+        account = ACCOUNTS[1]
+        self.bind_in_ui(account)
+        self.show_mailbox("unread")
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(self.window.account_list.currentItem().data(NAV_COUNT), 2)
+        original = self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole)
+        with patch.object(self.client, "mark_read", wraps=self.client.mark_read) as mark:
+            self.click_message(0)
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(self.window.subject.text(), original.subject)
+            self.assertIn("评审", self.window.body.toPlainText())
+            self.assertTrue(self.window.copy_button.isEnabled())
+            self.assertEqual(self.window.mail_list.count(), 1)
+            self.assertEqual(self.window.account_list.currentItem().data(NAV_COUNT), 1)
+            self.assertNotEqual(self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole).uid, original.uid)
+            self.show_mailbox("account", account.address)
+            self.window.refresh_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            refreshed = self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole)
+            self.assertEqual(refreshed.uid, original.uid)
+            self.assertFalse(refreshed.unread)
+            self.click_message(0)
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(mark.call_count, 1)
+
+    def test_failed_body_and_failed_mark_preserve_unread_until_successful_retry(self):
+        account = ACCOUNTS[1]
+        self.bind_in_ui(account)
+        self.show_mailbox("unread")
+        self.wait_until(lambda: not self.window.jobs)
+        with patch.object(self.client, "mark_read", side_effect=ConnectionError("无法保存已读")) as mark:
+            with patch.object(self.client, "read_body", side_effect=ConnectionError("网络中断")):
+                self.click_message(0)
+                self.wait_until(lambda: not self.window.jobs)
+                self.assertTrue(self.window.body_retry.isVisible())
+                mark.assert_not_called()
+            self.window.body_retry.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertIn("评审", self.window.body.toPlainText())
+            self.assertTrue(self.window.mail_list.currentItem().data(Qt.ItemDataRole.UserRole).unread)
+            self.assertTrue(self.window.reader.seen_retry.isVisible())
+            self.assertTrue(self.window.reader.seen_status.text())
+            mark.assert_called_once()
+        with patch.object(self.client, "read_body", wraps=self.client.read_body) as fetch:
+            self.window.reader.seen_retry.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(self.window.mail_list.count(), 1)
+            self.assertIn("评审", self.window.body.toPlainText())
+            self.assertFalse(self.window.reader.seen_retry.isVisible())
+            fetch.assert_not_called()
+
+    def test_late_mark_success_only_updates_original_account(self):
+        qq, netease = ACCOUNTS
+        self.client.release_qq.set()
+        for account in (qq, netease):
+            self.bind_in_ui(account)
+        self.show_mailbox("account", qq.address)
+        self.wait_until(lambda: not self.window.jobs)
+        started, release = threading.Event(), threading.Event()
+        original_mark = self.client.mark_read
+
+        def delayed_mark(account, secret, item):
+            started.set()
+            if not release.wait(4):
+                raise TimeoutError("等待切换窗口超时")
+            original_mark(account, secret, item)
+
+        with patch.object(self.client, "mark_read", side_effect=delayed_mark):
+            self.click_message(0)
+            try:
+                self.wait_until(started.is_set)
+                self.show_mailbox("account", netease.address)
+                self.wait_until(lambda: self.window.mail_list.count() == 3)
+            finally:
+                release.set()
+            self.wait_until(lambda: not self.window.jobs)
+        shown = self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole)
+        self.assertEqual(shown.account, netease.address)
+        self.assertTrue(shown.unread)
+        self.assertEqual(self.window.body.toPlainText(), "")
+        self.assertFalse(self.service.list_messages(qq).items[0].unread)
+
+    def test_demo_startup_preview_is_marked_only_when_user_opens_it(self):
+        account = ACCOUNTS[1]
+        self.service.bind(account.provider, account.address, "demo")
+        self.window.close()
+        self.window.deleteLater()
+        self.window = MainWindow(self.service, demo=True)
+        self.window.show()
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertIn("评审", self.window.body.toPlainText())
+        self.assertTrue(self.service.list_messages(account).items[0].unread)
+        self.click_message(0)
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertFalse(self.service.list_messages(account).items[0].unread)
+
+    def test_refresh_started_while_marking_cannot_restore_stale_unread_dot(self):
+        account = ACCOUNTS[1]
+        self.bind_in_ui(account)
+        self.wait_until(lambda: not self.window.jobs)
+        mark_started, finish_mark = threading.Event(), threading.Event()
+        page_snapshot, return_page = threading.Event(), threading.Event()
+        original_mark = self.client.mark_read
+        original_list = self.client.list_messages
+
+        def mark(*args):
+            mark_started.set()
+            if not finish_mark.wait(4):
+                raise TimeoutError("标记超时")
+            original_mark(*args)
+
+        def fetch(*args):
+            page = original_list(*args)
+            page_snapshot.set()
+            if not return_page.wait(4):
+                raise TimeoutError("刷新超时")
+            return page
+
+        with patch.object(self.client, "mark_read", side_effect=mark), patch.object(
+                self.client, "list_messages", side_effect=fetch):
+            try:
+                self.click_message(0)
+                self.wait_until(mark_started.is_set)
+                self.window.refresh_button.click()
+                self.wait_until(page_snapshot.is_set)
+                finish_mark.set()
+                self.wait_until(lambda: len(self.window.jobs) == 1)
+            finally:
+                finish_mark.set()
+                return_page.set()
+            self.wait_until(lambda: not self.window.jobs)
+        self.assertFalse(self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole).unread)
+
+    def test_poll_both_accounts_open_popup_read_and_complete(self):
+        qq, netease = ACCOUNTS
+        self.client.release_qq.set()
+        for account in (qq, netease):
+            self.bind_in_ui(account)
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(self.service.list_pending(), [])
+        self.assertFalse(self.window.popup.isVisible())
+
+        self.show_mailbox("account", qq.address)
+        self.client.simulate_arrival(netease)
+        self.window.search.setText("先前的搜索")
+        self.window.reminder_timer.setSingleShot(True)
+        self.window.reminder_timer.start(20)
+        self.wait_until(self.window.popup.isVisible)
+        self.window.popup.findChild(QPushButton, "viewReminder").click()
+        self.wait_until(lambda: self.window.copy_button.isEnabled())
+        self.assertEqual(self.window.nav_kind, "pending")
+        self.assertIn(netease.address, self.window.meta.text())
+        self.assertEqual(self.window.mail_list.count(), 1)
+        self.assertTrue(self.window.reader.complete.isVisible())
+        self.window.reader.complete.click()
+        self.wait_until(lambda: self.window.mail_list.count() == 0)
+        self.assertEqual(self.window.body.toPlainText(), "")
+        self.window.refresh_button.click()
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(self.service.list_pending(), [])
+        self.assertFalse(self.window.popup.isVisible())
+
+    def test_reminders_continue_and_failed_account_can_retry(self):
+        qq, netease = ACCOUNTS
+        for account in (qq, netease):
+            self.bind_in_ui(account)
+        self.wait_until(lambda: not self.window.jobs)
+        self.client.unavailable.add(qq.address)
+        self.client.simulate_arrival(qq)
+        self.window.simulate_button.click()  # The selected mailbox is 163.
+        self.wait_until(lambda: not self.window.jobs)
+        self.show_mailbox("pending")
+        self.assertEqual(self.window.mail_list.count(), 1)
+        self.assertIn(qq.address, self.window.notice_label.text())
+        self.assertEqual(self.window.mail_list.item(0).data(Qt.ItemDataRole.UserRole).account, netease.address)
+        self.client.unavailable.clear()
+        self.window.retry_button.click()
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertFalse(self.window.notice.isVisible())
+        self.assertEqual(self.window.mail_list.count(), 2)

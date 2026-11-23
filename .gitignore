@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+
+# Personal mailbox state and local credentials
+.env
+.env.*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.eml
+*.mbox
+
+# Local walkthrough assets
+/docs/邮件助手界面.png
+/maildesk/assets/reading-room.png
+/maildesk/local_demo_data.py
