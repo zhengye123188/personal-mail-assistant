@@ -168,7 +168,7 @@ class ReplyDialog(QDialog):
     model_completion_toggled = Signal(bool)
 
     def __init__(self, parent=None, *, account, recipient, subject, model_description="",
-                 generate=None, converse=None, draft_with=None, suggestions=(), complete=None, send, run, demo=False):
+                 generate=None, converse=None, draft_with=None, suggestions=(), complete=None, send, run):
         super().__init__(parent)
         self._send = send if recipient else None
         self._run = run
@@ -177,7 +177,6 @@ class ReplyDialog(QDialog):
         self._destroyed = Event()
         self.destroyed.connect(self._destroyed.set)
         self._model_status = False
-        self._demo = demo
         self.assistant_history = []
         self._converse = None
         self._draft_with = None
@@ -249,7 +248,6 @@ class ReplyDialog(QDialog):
         instructions_label.setObjectName("instructionsLabel")
         self.configure_button = _button("模型设置…", "configureReplyModel")
         self.configure_button.setFlat(True)
-        self.configure_button.setVisible(not demo)
         self.configure_button.clicked.connect(self.configure_requested)
         ai_header = QHBoxLayout()
         ai_header.addWidget(instructions_label)
@@ -318,7 +316,7 @@ class ReplyDialog(QDialog):
         actions = QHBoxLayout()
         actions.setContentsMargins(20, 4, 20, 12)
         self.copy_button = _button("复制正文", "copyReply")
-        self.send_button = _button("模拟发送" if demo else "发送回复", "sendReply")
+        self.send_button = _button("发送回复", "sendReply")
         actions.addWidget(self.copy_button)
         actions.addStretch()
         actions.addWidget(self.send_button)
@@ -394,10 +392,7 @@ class ReplyDialog(QDialog):
         hint = ""
         if enabled:
             title = "回复与助手"
-            if self._demo:
-                title += " · 离线示例"
-            hint = ("离线演示在本机处理。" if self._demo else
-                    f"{description} 将根据来信节选、你的要求和草稿作答。")
+            hint = f"{description} 将根据来信节选、你的要求和草稿作答。"
         self.setWindowTitle(title)
         self.model_hint.setText(hint)
         self._update_controls()
@@ -488,7 +483,7 @@ class ReplyDialog(QDialog):
         self.ask_button.setEnabled(ready and self._converse is not None)
         self.generate_button.setText("按要求修改" if can_send else "按要求起草")
         self.send_button.setEnabled(idle and can_send and self._send is not None)
-        self.send_button.setText("发送中…" if self.sending else "模拟发送" if self._demo else "发送回复")
+        self.send_button.setText("发送中…" if self.sending else "发送回复")
 
     def _show_status(self, message, *, model=False):
         self._model_status = model
@@ -588,7 +583,7 @@ class ReplyDialog(QDialog):
             return
         self._state = "sending"
         self._update_controls()
-        self._show_status("正在模拟发送…" if self._demo else "正在发送回复…")
+        self._show_status("正在发送回复…")
 
         def finished(_, error):
             if not isValid(self):

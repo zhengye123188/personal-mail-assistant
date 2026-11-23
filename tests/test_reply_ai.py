@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from maildesk.reply_ai import DemoReplyAI, MODELS, ReplyAI, ReplyAIError
+from maildesk.reply_ai import MODELS, ReplyAI, ReplyAIError
 
 
 def mock_connection(body, status=200):
@@ -143,16 +143,6 @@ class ReplyAITests(unittest.TestCase):
         conn.getresponse().read.assert_not_called()
         self.assertNotIn("test-only", str(error.exception))
         self.assertNotIn("private", str(error.exception))
-
-    def test_offline_demo_never_calls_model_service(self):
-        with patch("maildesk.reply_ai._request") as request:
-            ai = DemoReplyAI()
-            self.assertIn("演示", ai.description)
-            confirm = ai.generate("周五读书会", "原文", "确认收到")
-            self.assertIn("周五读书会", confirm)
-            decline = ai.generate("周五读书会", "原文", "礼貌婉拒")
-            self.assertNotEqual(confirm, decline)
-            request.assert_not_called()
 
 
 if __name__ == "__main__":

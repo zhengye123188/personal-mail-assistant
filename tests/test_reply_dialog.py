@@ -24,10 +24,10 @@ class ReplyDialogTests(unittest.TestCase):
         self.send = Mock()
         self.dialog = self.make_dialog()
 
-    def make_dialog(self, *, demo=False, **kwargs):
+    def make_dialog(self, **kwargs):
         dialog = ReplyDialog(
             account="sender@qq.com", recipient="reply@example.org", subject="Re: 确认时间",
-            send=self.send, run=lambda work, done: self.jobs.append((work, done)), demo=demo,
+            send=self.send, run=lambda work, done: self.jobs.append((work, done)),
             **kwargs,
         )
         dialog.show()
@@ -306,17 +306,6 @@ class ReplyDialogTests(unittest.TestCase):
         self.assertEqual(d.draft.toPlainText(), alternate.return_value)
         d.draft.undo()
         self.assertEqual(d.draft.toPlainText(), "我写的答复")
-
-    def test_demo_also_starts_as_plain_mail(self):
-        demo = self.make_dialog(demo=True)
-        self.assertEqual(demo.windowTitle(), "回复")
-        self.assertFalse(demo.ai_tools.isVisible())
-        self.assertEqual(demo.send_button.text(), "模拟发送")
-        demo.set_model("离线示例", self.generate)
-        self.assertTrue(demo.generate_button.isVisible())
-        self.assertIn("离线示例", demo.windowTitle())
-        self.assertFalse(demo.configure_button.isVisible())
-        self.assertEqual(self.jobs, [])
 
     def test_ask_then_rewrite_the_manually_edited_draft_without_sending(self):
         question = "对方要我确认什么？"

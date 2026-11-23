@@ -3,11 +3,11 @@
 import re
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 
 from .models import DRAFT_CONTEXT_LIMIT, MailItem, MailQuery, ReplyDraft
 from .providers import MAIL_PROVIDERS
-from .reply_ai import DemoReplyAI, ReplyAIError, structured_completion
+from .reply_ai import ReplyAIError, structured_completion
 from .service import _needs_attention
 
 
@@ -116,59 +116,6 @@ def _attention(item):
         item.subject + " " + item.preview))
 
 
-def _demo_plan(question, accounts, history, today):
-    """Deterministic, offline walkthrough using the same mail tools as cloud mode."""
-    q = question.lower()
-    draft = bool(re.search(r"帮我回|替我回|起草|草拟|写.{0,5}回复|拟.{0,4}回复|回复第|回第", q))
-    action = "draft" if draft else "read" if re.search(r"总结|概括|摘要|什么|几点|说了|比较|列出待办|内容", q) else "search"
-    if re.search(r"缩短|再短|简短一点|再简洁|更简洁|改得|改成|改为|修改草稿|润色|再礼貌|语气", q):
-        action = "revise"
-    elif q.startswith(("请记住", "记住", "补充一下，我")) and not draft:
-        action = "context"
-    plan = {"action": action, "attention": bool(re.search(r"待办|待处理|需要.{0,4}回|要我回|待回复", q)),
-            "unread_only": "未读" in q, "flagged_only": "旗标" in q}
-    providers = []
-    for code, profile in MAIL_PROVIDERS.items():
-        names = "|".join(re.escape(name) for name in (code, *profile.domains))
-        if re.search(rf"(?<![a-z0-9_@.])(?:{names})(?![a-z0-9_.])", q):
-            providers.append(code)
-    if providers:
-        plan["accounts"] = [i for i, a in enumerate(accounts, 1) if a.provider in providers]
-        if not plan["accounts"]:
-            plan["action"] = "clarify"
-    if "昨天" in q:
-        plan.update(since=str(today - timedelta(days=1)), before=str(today))
-    elif "今天" in q or "今日" in q:
-        plan.update(since=str(today), before=str(today + timedelta(days=1)))
-    elif "上周" in q:
-        monday = today - timedelta(days=today.weekday())
-        plan.update(since=str(monday - timedelta(days=7)), before=str(monday))
-    elif "本周" in q or "这周" in q:
-        plan["since"] = str(today - timedelta(days=today.weekday()))
-    elif "一周" in q or "七天" in q or "7天" in q or "最近" in q:
-        plan["since"] = str(today - timedelta(days=6))
-
-    last_turn = next((turn for turn in reversed(history) if turn["来源"]), {})
-    last = last_turn.get("来源", [])
-    positions = _positions(q)
-    if positions:
-        turn = last_turn.get("轮", 0)
-        plan["refs"] = [f"{turn}:{n}" for n in positions]
-        if action == "search":
-            plan["action"] = "read"
-    elif last and (draft or re.search(r"这(些|几封|封)|刚才|上述|上面|它们?|对方", q)):
-        plan["refs"] = [card["key"] for card in last]
-    elif topic := re.search(r"(?:关于|包含)\s*(.+?)(?:的邮件|的来信|[？?。！]|$)", question):
-        plan["text"] = topic[1].strip()
-    elif sender := re.search(r"(?:发件人[为是：: ]*|来自|查找|找一下|找找)\s*([^，。？?\s]{1,50}?)\s*(?:发来的|发的|的来信|的邮件)", q):
-        plan["sender"] = sender[1]
-    elif keyword := re.search(r"[「“《\"](.+?)[」”》\"]|(?:关于|包含|搜索|查找)\s*(.+?)(?:的邮件|的来信|[？?。！]|$)", question):
-        plan["text"] = (keyword[1] or keyword[2]).strip()
-    elif label := re.search(r"github|发票|面试|会议|评审|读书会|校样|工作室|图书馆", q):
-        plan["text"] = label[0]
-    return plan
-
-
 def _query(plan):
     def day(name):
         value = plan.get(name)
@@ -190,11 +137,7 @@ def _query(plan):
         raise ReplyAIError("查询条件无法识别。请换一个关键词或明确日期范围。") from None
 
 
-def _conclusions(model, question, evidence, history, demo, attention):
-    if demo:
-        return [{"text": f"{row['主题']}：{row['正文'] or row['摘要'] or '只有邮件标题可供参考。'}"[:255],
-                 "sources": [i]} for i, row in enumerate(evidence, 1)
-                if not attention or row["需处理线索"]]
+def _conclusions(model, question, evidence, history):
     result = structured_completion(model, _ANSWER, {"问题": question, "近期对话": history, "本次邮件证据": evidence})
     parts = result.get("parts")
     if not isinstance(parts, list):
@@ -220,14 +163,10 @@ class MailChat:
         allowed = {account.address: account for account in accounts}
         memory, refs = _history_context(history, allowed)
         day = today or date.today()
-        demo = isinstance(self.model, DemoReplyAI)
-        if demo:
-            plan = _demo_plan(question, accounts, memory, day)
-        else:
-            mailboxes = {i: {"地址": account.address, "服务商": MAIL_PROVIDERS[account.provider].name}
-                         for i, account in enumerate(accounts, 1)}
-            plan = structured_completion(self.model, _PLAN, {"今天": str(day), "问题": question,
-                                                            "近期对话": memory, "可查询邮箱": mailboxes})
+        mailboxes = {i: {"地址": account.address, "服务商": MAIL_PROVIDERS[account.provider].name}
+                     for i, account in enumerate(accounts, 1)}
+        plan = structured_completion(self.model, _PLAN, {"今天": str(day), "问题": question,
+                                                        "近期对话": memory, "可查询邮箱": mailboxes})
         _check(cancelled)
         action = plan.get("action")
         if action == "context":
@@ -344,7 +283,7 @@ class MailChat:
             return finish(answer, items, item, draft, record)
 
         try:
-            parts = _conclusions(self.model, question, evidence, memory, demo, attention)
+            parts = _conclusions(self.model, question, evidence, memory)
         except ReplyAIError as exc:
             return finish(f"已找到这些邮件，回答生成失败。{exc}", items)
         cited, lines = [], []

@@ -4,9 +4,9 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
-from maildesk.demo import DemoVault
 from maildesk.models import MailItem, ReplyDraft, ReplyEnvelope
 from maildesk.service import MailService
+from tests.mail_fixtures import MemoryVault
 
 
 class DraftStorageTests(unittest.TestCase):
@@ -15,7 +15,7 @@ class DraftStorageTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "accounts.sqlite"
         self.client = Mock()
-        self.service = MailService(self.path, self.client, DemoVault())
+        self.service = MailService(self.path, self.client, MemoryVault())
         self.qq = self.service.bind("qq", "me@qq.com", "test")
         self.other = self.service.bind("163", "me@163.com", "test")
 
@@ -29,7 +29,7 @@ class DraftStorageTests(unittest.TestCase):
         draft = self.draft(self.qq.address)
         self.service.save_draft(draft)
         saved = self.service.save_draft(replace(draft, text="周六下午更方便。"))
-        offline = MailService(self.path, Mock(), DemoVault())
+        offline = MailService(self.path, Mock(), MemoryVault())
         self.assertEqual(offline.list_drafts(), [saved])
         self.assertEqual(offline.list_drafts(include_original=False), [replace(saved, original_text="")])
         self.assertEqual(offline.original_for_draft(draft.item), draft.original_text)

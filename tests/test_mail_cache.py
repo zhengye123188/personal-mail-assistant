@@ -8,10 +8,9 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import Mock, patch
 
-from maildesk.demo import DemoVault
 from maildesk.models import MailBody, MailPage, ReplyEnvelope
 from maildesk.service import MailService
-from tests.mail_fixtures import ACCOUNTS, FixtureClient, PNG
+from tests.mail_fixtures import ACCOUNTS, FixtureClient, MemoryVault, PNG
 
 
 class MailCacheTests(unittest.TestCase):
@@ -20,7 +19,7 @@ class MailCacheTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "accounts.sqlite3"
         self.client = FixtureClient()
-        self.service = MailService(self.path, self.client, DemoVault())
+        self.service = MailService(self.path, self.client, MemoryVault())
         self.account, self.other = ACCOUNTS
         for account in ACCOUNTS:
             self.service.bind(account.provider, account.address, "test")
@@ -36,7 +35,7 @@ class MailCacheTests(unittest.TestCase):
         fetch = Mock(return_value={url: PNG})
         self.service.read_images(self.item, (url,), fetch, cancelled=lambda: False)
         self.service.mark_read(self.account, self.item)
-        offline = MailService(self.path, Mock(), DemoVault())
+        offline = MailService(self.path, Mock(), MemoryVault())
         snap = offline.cached_first_page(self.account)
         self.assertEqual(snap.items[0], replace(self.item, unread=False))
         self.assertIsNone(snap.next_cursor)

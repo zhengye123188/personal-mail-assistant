@@ -124,13 +124,6 @@ def _requests(text):
     return result
 
 
-def strip_language_request(instruction):
-    result = instruction
-    for start, end, _, _ in reversed(_requests(instruction)):
-        result = result[:start] + result[end:]
-    return result.strip(" ，,。.!！；;：:\n\t")
-
-
 def language_context(subject, body, instruction, *, previous_draft="", prior_instructions=()):
     """Return a bounded sender sample, a best-effort BCP 47 hint, and its provenance."""
     source, sample = "body", _sample(body)

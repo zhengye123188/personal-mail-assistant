@@ -132,13 +132,13 @@ QLineEdit#mailSearch { color: #202124; background: #f3f3f5; border: 1px solid tr
     border-radius: 16px; padding: 4px 8px; font-size: 14px; selection-background-color: #b6d8ff; }
 QLineEdit#mailSearch:focus { border: 1px solid #6da9ed; }
 QLabel#viewHeading { font-size: 16px; font-weight: 650; }
-QLabel#listStatus, QLabel#demoLabel, QLabel#emptyListLabel { color: #727278; font-size: 12px; }
+QLabel#listStatus, QLabel#emptyListLabel { color: #727278; font-size: 12px; }
 QLabel#listError, QLabel#bindStatus { color: #99511c; }
 QPushButton#bindButton, QPushButton#updateBindingButton, QPushButton#loadOlderButton, QPushButton#retryListButton,
-QPushButton#aiSettings, QPushButton#simulateArrival {
+QPushButton#aiSettings {
     background: transparent; color: #096ec9; border: 0; padding: 5px 7px; border-radius: 6px; }
 QPushButton#bindButton:hover, QPushButton#updateBindingButton:hover, QPushButton#loadOlderButton:hover,
-QPushButton#retryListButton:hover, QPushButton#aiSettings:hover, QPushButton#simulateArrival:hover { background: #e7eaf0; }
+QPushButton#retryListButton:hover, QPushButton#aiSettings:hover { background: #e7eaf0; }
 QLabel#dialogHeading { font-size: 19px; font-weight: bold; } QLabel#muted { color: #68686f; }
 QDialog QLineEdit, QDialog QComboBox { color: #242427; background: #fff;
     border: 1px solid #ceced2; border-radius: 6px; padding: 6px; }
@@ -212,11 +212,10 @@ def _key(item):
 
 
 class _BindDialog(QDialog):
-    def __init__(self, parent, account, demo):
+    def __init__(self, parent, account):
         super().__init__(parent)
         self.setObjectName("bindDialog")
         self.is_update = account is not None
-        self.demo = demo
         self.setWindowTitle(f"更新{MAIL_PROVIDERS[account.provider].credential_label}" if account else "绑定邮箱")
         self.setMinimumWidth(420)
         self.busy = False
@@ -235,9 +234,8 @@ class _BindDialog(QDialog):
         self.domain.setObjectName("domainCombo")
         self.domain.setAccessibleName("邮箱后缀")
         for code, profile in MAIL_PROVIDERS.items():
-            if not demo or code in ("qq", "163"):
-                for domain in profile.domains:
-                    self.domain.addItem("@" + domain, code)
+            for domain in profile.domains:
+                self.domain.addItem("@" + domain, code)
         address_row = QHBoxLayout()
         address_row.setSpacing(6)
         address_row.addWidget(self.address, 1)
@@ -262,7 +260,6 @@ class _BindDialog(QDialog):
         layout.addWidget(self.setup_hint)
         self.help_link = QLabel()
         self.help_link.setOpenExternalLinks(True)
-        self.help_link.setVisible(not demo)
         layout.addWidget(self.help_link)
         self.status = _label("", "bindStatus", True)
         self.status.hide()
@@ -300,7 +297,7 @@ class _BindDialog(QDialog):
         self.credential_label.setText(profile.credential_label)
         self.secret.clear()
         self.secret.setPlaceholderText(f"请输入{profile.credential_label}")
-        self.setup_hint.setText("演示模式可填写任意非空授权码。" if self.demo else profile.setup_hint)
+        self.setup_hint.setText(profile.setup_hint)
         self.help_link.setText(f'<a href="{profile.help_url}">查看{profile.name}的官方设置说明</a>')
         self.show_status("")
 
@@ -322,12 +319,10 @@ class _BindDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, service, demo=False, simulate_arrival=None):
+    def __init__(self, service):
         super().__init__()
         self.service = service
-        self.demo = demo
-        self.simulate_arrival = simulate_arrival if demo else None
-        self.setWindowTitle("个人邮件助手 · 演示模式" if demo else "个人邮件助手")
+        self.setWindowTitle("个人邮件助手")
         self.accounts = []
         self.items = {}
         self.cursors = {}
@@ -348,15 +343,13 @@ class MainWindow(QMainWindow):
         self.image_download_stop = Event()
         self.reading_item = None
         self.body_ready = False
-        self.preview_only = False
         self.marking_read = set()
         self.job_id = 0
         self.jobs = {}
         self.binding = None
-        self.reply_prefs = None if demo else QSettings("PersonalMailAssistant", "ReplyModels")
+        self.reply_prefs = QSettings("PersonalMailAssistant", "ReplyModels")
         self.reply_choice = saved_choice(self.reply_prefs)
-        self.model_completions = (self.reply_prefs.value("modelCompletions", False, type=bool)
-                                  if self.reply_prefs is not None else False)
+        self.model_completions = self.reply_prefs.value("modelCompletions", False, type=bool)
         self.reply_model = selected_model(self.reply_choice, self.reply_prefs)
         self.model_settings = None
         self.chat_dialog = None
@@ -374,7 +367,6 @@ class MainWindow(QMainWindow):
         self.filter_mode = "all"
         self.nav_kind = "all"
         self.mailbox_flags = {}
-        self.preview_demo_message = False
         self._build_window()
         bar = self.statusBar()
         bar.setSizeGripEnabled(False)
@@ -385,7 +377,7 @@ class MainWindow(QMainWindow):
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(60_000)
         self.reminder_timer.timeout.connect(self._poll_reminders)
-        self._load_accounts(initial=True)
+        self._load_accounts()
         self.reminder_timer.start()
 
     def _build_window(self):
@@ -476,12 +468,6 @@ class MainWindow(QMainWindow):
         self.account_list.setItemDelegate(_SidebarDelegate(self.account_list))
         self.account_list.currentItemChanged.connect(self._account_changed)
         layout.addWidget(self.account_list, 1)
-        if self.demo:
-            layout.addWidget(_label("演示邮箱", "demoLabel"), 0, Qt.AlignmentFlag.AlignHCenter)
-        if self.simulate_arrival:
-            self.simulate_button = _button("模拟收到待处理邮件", "simulateArrival")
-            self.simulate_button.clicked.connect(self._simulate_reminder)
-            layout.addWidget(self.simulate_button)
         self.chat_button = _button("邮箱助手", "mailChat")
         self.chat_button.setStyleSheet("QPushButton {color: #185997; background: #e2ecf7; border: none;"
                                        " border-radius: 7px; padding: 7px;} QPushButton:hover {background: #d7e6f7}")
@@ -548,7 +534,6 @@ class MainWindow(QMainWindow):
         self.mail_delegate = MailDelegate(self.mail_list)
         self.mail_list.setItemDelegate(self.mail_delegate)
         self.mail_list.currentItemChanged.connect(self._mail_changed)
-        self.mail_list.itemClicked.connect(self._commit_preview)
         self.mail_list.itemActivated.connect(self._activate_row)
         self.list_stack.addWidget(self.mail_list)
         self.empty_list = _label("", "emptyListLabel", True)
@@ -815,12 +800,6 @@ class MainWindow(QMainWindow):
             self._run(lambda a=account: self.service.poll_pending(a), done)
         self._list_state()
 
-    def _simulate_reminder(self):
-        targets = self._targets()
-        if targets and not self.polling:
-            self.simulate_arrival(targets[0])
-            self._poll_reminders()
-
     def _open_pending(self):
         if self.isMinimized():
             self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
@@ -866,7 +845,7 @@ class MainWindow(QMainWindow):
         if self.nav_kind != "drafts":
             self._poll_reminders()
 
-    def _load_accounts(self, select=None, *, initial=False):
+    def _load_accounts(self, select=None):
         known = {a.address for a in self.accounts}
         try:
             self.accounts = list(self.service.accounts())
@@ -884,7 +863,6 @@ class MainWindow(QMainWindow):
         self._update_chat()
         self.account_list.blockSignals(True)
         self.account_list.clear()
-        self.preview_demo_message = self.demo and initial and bool(self.accounts)
         def section(title):
             entry = QListWidgetItem(title, self.account_list)
             entry.setData(NAV_KIND, "section")
@@ -931,7 +909,7 @@ class MainWindow(QMainWindow):
             self.binding.raise_()
             self.binding.activateWindow()
             return
-        dialog = _BindDialog(self, account, self.demo)
+        dialog = _BindDialog(self, account)
         self.binding = dialog
         dialog.finished.connect(lambda: self._release_binding(dialog))
         dialog.submit.clicked.connect(lambda: self._bind(dialog))
@@ -1209,16 +1187,8 @@ class MainWindow(QMainWindow):
                                        and not (in_queue and self.polling))
         self.older_button.setVisible(has_older and not (in_queue or in_drafts))
         self.older_button.setEnabled(not loading)
-        if self.simulate_arrival:
-            self.simulate_button.setEnabled(bool(self.accounts) and not self.polling)
         if visible:
             self.list_stack.setCurrentWidget(self.mail_list)
-            if self.preview_demo_message and not loading and not in_queue and not in_drafts:
-                self.preview_demo_message = False
-                self.mail_list.blockSignals(True)
-                self.mail_list.setCurrentRow(0)
-                self.mail_list.blockSignals(False)
-                self._mail_changed(self.mail_list.currentItem(), preview=True)
         else:
             self.list_stack.setCurrentWidget(self.empty_list)
             if in_drafts:
@@ -1264,7 +1234,7 @@ class MainWindow(QMainWindow):
             return
         if self.chat_dialog is None:
             self.chat_dialog = ChatDialog(self, accounts=tuple(self.accounts), model_description=self.reply_model.description,
-                                         ask=MailChat(self.service, self.reply_model).ask, run=self._run, demo=self.demo)
+                                         ask=MailChat(self.service, self.reply_model).ask, run=self._run)
             self.chat_dialog.open_mail.connect(self._open_chat_source)
             self.chat_dialog.compose_reply.connect(self._open_chat_draft)
             self.chat_dialog.draft_ready.connect(self._save_chat_draft)
@@ -1417,8 +1387,7 @@ class MainWindow(QMainWindow):
 
     def _set_model_completions(self, enabled):
         self.model_completions = enabled
-        if self.reply_prefs is not None:
-            self.reply_prefs.setValue("modelCompletions", enabled)
+        self.reply_prefs.setValue("modelCompletions", enabled)
         for draft in self.reply_drafts.values():
             draft.dialog.model_completion.setChecked(enabled)
 
@@ -1435,7 +1404,7 @@ class MainWindow(QMainWindow):
             draft_with=partial(compose_draft, ai, item.subject, text) if ai else None,
             converse=partial(compose_turn, ai, item.subject, text) if ai else None,
             send=partial(self.service.send_reply, account, item, envelope) if envelope else None,
-            run=self._run, demo=self.demo,
+            run=self._run,
         )
         timer = QTimer(dialog)
         timer.setSingleShot(True)
@@ -1469,7 +1438,7 @@ class MainWindow(QMainWindow):
                 self.saved_drafts.pop(key, None)
                 self.sent_cleanup[key] = item
                 cleared = self._delete_draft_record(item)
-                confirmation = "演示回复已完成" if self.demo else "发件服务器已接收回复"
+                confirmation = "发件服务器已接收回复"
                 if not cleared:
                     confirmation += "（本机草稿待清理）"
                 self.statusBar().showMessage(f"{confirmation} · {envelope.recipient}", 6500)
@@ -1513,17 +1482,10 @@ class MainWindow(QMainWindow):
     def _activate_row(self, row):
         if self.nav_kind == "drafts":
             self._resume_reply(row.data(USER_ROLE))
-        else:
-            self._commit_preview(row)
-
-    def _commit_preview(self, row):
-        if self.preview_only and self.reading_item is not None and _key(row.data(USER_ROLE)) == _key(self.reading_item):
-            self.preview_only = False
-            self._sync_seen()
 
     def _sync_seen(self):
         item = self.reading_item
-        if item is None or not self.body_ready or self.preview_only or item.unread is False:
+        if item is None or not self.body_ready or item.unread is False:
             return
         account = next((a for a in self.accounts if a.address == item.account), None)
         if account is None:
@@ -1569,7 +1531,7 @@ class MainWindow(QMainWindow):
         if complete:
             self.reader.complete.setEnabled(_key(current.data(USER_ROLE)) not in self.finishing)
 
-    def _mail_changed(self, row, previous=None, *, preview=False):
+    def _mail_changed(self, row, previous=None):
         self.image_download_stop.set()
         self.image_download_stop = Event()
         self.body_id += 1
@@ -1577,7 +1539,6 @@ class MainWindow(QMainWindow):
         self.body_ready = False
         self.reply_envelope = None
         self.reply_button.setEnabled(False)
-        self.preview_only = preview
         self.reading_item = row.data(USER_ROLE) if row is not None else None
         self._update_navigation()
         self.copy_button.setEnabled(False)

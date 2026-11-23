@@ -1,6 +1,6 @@
 import unittest
 
-from maildesk.reply_language import language_context, strip_language_request, wrong_reply_language
+from maildesk.reply_language import language_context, wrong_reply_language
 
 
 class ReplyLanguageTests(unittest.TestCase):
@@ -49,7 +49,6 @@ class ReplyLanguageTests(unittest.TestCase):
             with self.subTest(req=req):
                 self.assertEqual(language_context(*base, req, **opts)["target"], "zh")
         self.assertEqual(language_context(*base, "再简短些", prior_instructions=("用英文回复。",))["target"], "zh")
-        self.assertEqual(strip_language_request("请用英文回复，询问具体时间。"), "询问具体时间")
 
     def test_mentions_negation_and_bilingual_requests(self):
         for req in ("告诉对方我会说英语。", "问问中英联合会议的地址", "问问他们是否提供双语材料",

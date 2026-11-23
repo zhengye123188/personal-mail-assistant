@@ -90,15 +90,14 @@ class ChatDialog(QDialog):
     compose_reply = Signal(object, str)
     draft_ready = Signal(object, str)
 
-    def __init__(self, parent=None, *, accounts, model_description, ask, run, demo=False):
+    def __init__(self, parent=None, *, accounts, model_description, ask, run):
         super().__init__(parent)
         self.setObjectName("chatDialog")
-        self.setWindowTitle("邮箱助手 · 离线演示" if demo else "邮箱助手")
+        self.setWindowTitle("邮箱助手")
         self.resize(650, 660)
         self.setMinimumSize(390, 420)
         self._run = run
         self._ask = ask
-        self._demo = demo
         self._conversation_id = 0
         self._pending = None
         self._question_row = None
@@ -227,8 +226,7 @@ class ChatDialog(QDialog):
         self.scope.setCurrentIndex(max(0, self.scope.findData(previous)))
         self.scope.blockSignals(False)
         self._ask = ask
-        self.model_label.setText("离线演示 · 使用示例邮箱" if self._demo else
-                                 f"提问时，问题与相关邮件节选将交给{model_description}。")
+        self.model_label.setText(f"提问时，问题与相关邮件节选将交给{model_description}。")
         self.reset()
 
     @property

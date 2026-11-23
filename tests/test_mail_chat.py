@@ -6,12 +6,11 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import Mock
 
-from maildesk.demo import DemoVault
 from maildesk.mail_chat import ChatTurn, MailChat
 from maildesk.models import Account, MailBody, MailItem, MailSearchResult
-from maildesk.reply_ai import DemoReplyAI, ReplyAI, ReplyAIError
+from maildesk.reply_ai import ReplyAI, ReplyAIError
 from maildesk.service import MailService
-from tests.mail_fixtures import ACCOUNTS, FixtureClient
+from tests.mail_fixtures import ACCOUNTS, FixtureClient, MemoryVault
 
 
 QQ, NETEASE = ACCOUNTS
@@ -48,17 +47,28 @@ class MailChatTests(unittest.TestCase):
         service = Mock()
         service.search_mail.return_value = MailSearchResult([item], False)
         service.read_content.return_value = MailBody("")
-        reply = MailChat(service, DemoReplyAI()).ask("帮我回，确认收到", [QQ])
+        model = ReplyAI(provider="deepseek")
+        model.complete = Mock(side_effect=[json.dumps({"action": "draft"}), "I have received the invitation."])
+        reply = MailChat(service, model).ask("帮我回，确认收到", [QQ])
         self.assertEqual(reply.draft_item, item)
-        self.assertIn("received", reply.draft_text)
+        language = json.loads(model.complete.call_args.args[0][1]["content"])["回复语言"]
+        self.assertEqual((language["target"], language["source"]), ("en", "subject"))
 
-    def test_offline_cross_inbox_search_then_reply_to_second_source(self):
+    def test_cross_inbox_search_then_reply_to_second_source(self):
         with tempfile.TemporaryDirectory() as folder:
             client = FixtureClient()
-            service = MailService(Path(folder) / "demo.db", client, DemoVault())
+            service = MailService(Path(folder) / "mail.db", client, MemoryVault())
             for account in ACCOUNTS:
-                service.bind(account.provider, account.address, "demo")
-            chat = MailChat(service, DemoReplyAI())
+                service.bind(account.provider, account.address, "fixture")
+            model = ReplyAI(provider="deepseek")
+            model.complete = Mock(side_effect=[
+                json.dumps({"action": "search", "attention": True}),
+                json.dumps({"parts": [{"text": "确认读书会安排", "sources": [1]},
+                                      {"text": "确认设计评审时间", "sources": [2]}]}),
+                json.dumps({"action": "draft", "refs": ["1:2"]}), "我已收到评审时间，请问周三下午几点开始？",
+                json.dumps({"action": "revise", "refs": ["2:1"]}), "请问评审几点开始？",
+            ])
+            chat = MailChat(service, model)
             found = chat.ask("最近有哪些邮件需要回复？", ACCOUNTS)
             self.assertEqual([m.account for m in found.sources], [QQ.address, NETEASE.address])
             self.assertEqual(found.sources[0].uid, found.sources[1].uid)
@@ -67,8 +77,9 @@ class MailChatTests(unittest.TestCase):
             self.assertIn("评审", reply.draft_text)
             revised = chat.ask("把这份回复再缩短一点", ACCOUNTS, [found, reply])
             self.assertEqual(revised.draft_item, reply.draft_item)
-            self.assertLess(len(revised.draft_text), len(reply.draft_text))
-            self.assertIn("评审", revised.draft_text)
+            revision = json.loads(model.complete.call_args.args[0][1]["content"])
+            self.assertEqual(revision["待修改草稿"], reply.draft_text)
+            self.assertEqual(revision["收到的邮件"]["主题"], found.sources[1].subject)
             self.assertTrue(service.list_messages(NETEASE).items[0].unread)
             self.assertEqual(client.sent_replies, [])
 
@@ -146,20 +157,18 @@ class MailChatTests(unittest.TestCase):
         self.assertEqual(context[0]["引用主题"], [a.subject, b.subject])
         service.read_content.assert_called_once_with(QQ, b)
 
-    def test_offline_topic_query_prefers_the_explicit_keyword(self):
-        service = Mock()
-        service.search_mail.return_value = MailSearchResult([], False)
-        MailChat(service, DemoReplyAI()).ask("查找关于校样的邮件", [QQ])
-        query = service.search_mail.call_args.args[1]
-        self.assertEqual((query.text, query.sender), ("校样", ""))
-
     def test_provider_scope_can_select_two_gmail_accounts_and_exclude_qq(self):
         gmail = [Account("first@gmail.com", "gmail"), Account("second@googlemail.com", "gmail")]
         service = Mock()
         service.search_mail.return_value = MailSearchResult([], False)
-        chat = MailChat(service, DemoReplyAI())
+        model = Mock()
+        outputs(model, {"action": "search", "accounts": [2, 3], "unread_only": True}, {"action": "clarify"})
+        chat = MailChat(service, model)
         chat.ask("只看 Gmail 收件箱里的未读邮件", [QQ, *gmail])
         self.assertEqual([call.args[0] for call in service.search_mail.call_args_list], gmail)
+        mailboxes = json.loads(model.complete.call_args.args[0][1]["content"])["可查询邮箱"]
+        self.assertEqual([box["地址"] for box in mailboxes.values()], [a.address for a in (QQ, *gmail)])
+        self.assertTrue(all(call.args[1].unread_only for call in service.search_mail.call_args_list))
         service.reset_mock()
         chat.ask("只看 Gmail 收件箱里的未读邮件", [QQ])
         service.search_mail.assert_not_called()

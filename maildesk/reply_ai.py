@@ -6,8 +6,7 @@ import os
 from collections.abc import Callable
 from contextlib import closing
 
-from .demo_reply_language import demo_foreign_draft
-from .reply_language import REPLY_LANGUAGE_POLICY, language_context, strip_language_request, wrong_reply_language
+from .reply_language import REPLY_LANGUAGE_POLICY, language_context, wrong_reply_language
 
 
 _SYSTEM = """你是个人邮箱用户的写作助手。根据用户的回复要求，为收件人写一封简洁自然的回信。
@@ -184,30 +183,3 @@ class ReplyAI:
         if reason and reason != "stop":
             raise ReplyAIError("模型未完成草稿，请调整回复要求后重试。")
         return _draft(message.get("content") if isinstance(message, dict) else None)
-
-
-class DemoReplyAI:
-    description = "离线演示 · 示例草稿"
-
-    def generate(self, subject: str, body: str, instruction: str, *, previous_draft: str = "",
-                 conversation=(), prior_instructions=()) -> str:
-        language = language_context(subject, body, instruction, previous_draft=previous_draft,
-                                    prior_instructions=prior_instructions)
-        if language["target"] != "zh":
-            return demo_foreign_draft(language["target"], subject, body, instruction, previous_draft,
-                                      conversation=conversation)
-        if previous_draft.strip() and wrong_reply_language(language, previous_draft):
-            raise ReplyAIError("将现有草稿译成中文需要接入语言模型。")
-        instruction = strip_language_request(instruction)
-        if previous_draft.strip() and not instruction:
-            return previous_draft
-        topic = "《" + subject.strip()[:80] + "》" if subject.strip() else "这封邮件"
-        if previous_draft and any(word in instruction for word in ("短", "简洁", "精简")):
-            return previous_draft.replace("你好，\n\n", "").replace("谢谢你的来信。", "").replace("，谢谢告知", "")
-        if previous_draft and any(word in instruction for word in ("礼貌", "客气", "正式")):
-            return "您好，\n\n" + previous_draft.removeprefix("你好，\n\n").removeprefix("您好，\n\n") + "\n\n感谢您的来信。"
-        if any(word in instruction for word in ("婉拒", "拒绝", "不方便")):
-            return f"你好，\n\n谢谢你的来信。关于{topic}中提到的安排，这次我不方便参加。感谢理解。"
-        if any(word in instruction for word in ("补充", "询问", "澄清")):
-            return f"你好，\n\n我收到了{topic}。请问你希望我重点确认哪些事项？谢谢。"
-        return f"你好，\n\n我已收到{topic}，谢谢告知。"

@@ -1,4 +1,4 @@
-"""Build a static browser document from an HTML or plain-text email."""
+"""Prepare static HTML for Qt rich-text mail reading."""
 
 import re
 from collections.abc import Callable
@@ -9,37 +9,19 @@ from urllib.parse import urljoin, urlsplit
 from .models import MailBody, normalize_cid
 
 
-# Chromium can use the sender's CSS, but all image bytes must come from the
-# reader's per-message handler. This also applies to URLs inside stylesheets.
-_CSP = ("default-src 'none'; img-src maildesk:; style-src 'unsafe-inline'; "
-        "base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'")
-_DEFAULT_STYLE = """
-:root { color-scheme: light; }
-:where(body) { margin: 16px 20px; font: 15px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
-               overflow-wrap: break-word; }
-:where(body:not([bgcolor])) { background: white; }
-:where(body:not([text])) { color: #24292f; }
-:where(body:not([link]) a[href]) { color: #0969da; }
-:where(table, img, svg) { max-width: 100%; }
-:where(img[data-maildesk-sized]) {
-    aspect-ratio: attr(width type(<number>)) / attr(height type(<number>)); height: auto;
-}
-img[data-maildesk-image="pending"] { max-height: 500px; object-fit: contain; }
-img[data-maildesk-image="failed"] { width: auto !important; height: auto !important;
-    min-width: 0 !important; min-height: 0 !important; max-width: 100% !important;
-    max-height: 2em !important; }
-:where(pre) { white-space: pre-wrap; }
-"""
+_DEFAULT_STYLE = "img { max-width: 100%; } pre { white-space: pre-wrap; }"
+_HIDDEN_STYLE = re.compile(r"(?:^|;)\s*display\s*:\s*none\s*(?:!\s*important\s*)?(?:;|$)", re.I)
+_CLASS_RULE = re.compile(r"(?:^|(?<=}))\s*((?:\.[\w-]+\s*,\s*)*\.[\w-]+)\s*\{([^{}]*)}", re.MULTILINE)
 _TAGS = set("""
     a abbr address article aside b bdi bdo big blockquote br button caption center cite code
     col colgroup dd del details dfn div dl dt em figure figcaption font footer h1 h2 h3 h4 h5 h6
     header hr i img ins kbd li main mark ol p pre q rp rt ruby s samp section small span strike
     strong sub summary sup table tbody td tfoot th thead time tr tt u ul var wbr
 """.split())
-_VOID = {"br", "col", "hr", "img", "wbr"}
+_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 _OMIT_CONTENT = set("""
     applet audio canvas datalist frameset iframe math noembed noscript object script select
-    template textarea title video xml xmp
+    svg template textarea title video xml xmp
 """.split())
 # Legacy attributes such as cellpadding and bgcolor are still common in email.
 _ATTRS = set("""
@@ -50,26 +32,6 @@ _ATTRS = set("""
 _WEB_IN_TEXT = re.compile(r"""https?://[^\s<>"'。，、；！？《》“”]+""", re.IGNORECASE)
 _MAX_HTML = 8 * 1024 * 1024
 _MAX_PARTS = 100_000
-_PIXEL_SIZE = re.compile(r"[1-9][0-9]{0,4}")
-_SVG_TAGS = {"svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "title", "desc"}
-_SVG_ATTRS = set("""
-    aria-hidden aria-label class color cx cy d fill fill-opacity fill-rule height opacity points
-    r role rx ry stroke stroke-linecap stroke-linejoin stroke-opacity stroke-width style transform
-    width x x1 x2 y y1 y2
-""".split())
-
-
-def _svg_attrs(fields):
-    result = {name: value or "" for name, value in fields.items() if name in _SVG_ATTRS}
-    for name in ("fill", "stroke"):
-        if name in result and not re.fullmatch(r"[#\w\s.,%()+/-]+", result[name]):
-            del result[name]
-        elif name in result and "url(" in result[name].lower():
-            del result[name]
-    for name in ("viewBox", "preserveAspectRatio"):
-        if fields.get(name.lower()):
-            result[name] = fields[name.lower()]
-    return result
 
 
 def safe_link(value: str, base: str = "") -> str | None:
@@ -97,7 +59,11 @@ def _attributes(fields):
 
 
 def _layout_attrs(fields):
-    return {name: value or "" for name, value in fields.items() if name in _ATTRS or name == "aria-label"}
+    attrs = {name: value or "" for name, value in fields.items() if name in _ATTRS or name == "aria-label"}
+    for key in ("rowspan", "colspan"):
+        if key in attrs and not re.fullmatch(r"[1-9][0-9]?", attrs[key]):
+            del attrs[key]
+    return attrs
 
 
 def _tag_name(tag):
@@ -106,9 +72,8 @@ def _tag_name(tag):
 
 
 class _MailParser(HTMLParser):
-    def __init__(self, text_preview=False):
+    def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.text_preview = text_preview
         self.parts = []
         self.styles = []
         self.html_attrs = {}
@@ -117,7 +82,8 @@ class _MailParser(HTMLParser):
         self.in_head = False
         self.in_style = False
         self.omitted = []
-        self.vector = []
+        self.hidden_classes = set()
+        self.depth = 0
         self.has_content = False
         self.has_image = False
 
@@ -125,27 +91,17 @@ class _MailParser(HTMLParser):
         tag = _tag_name(tag)
         if len(self.parts) + len(self.styles) >= _MAX_PARTS:
             raise ValueError("mail markup exceeds preview limits")
-        if self.text_preview and tag in {"style", "svg"}:
-            self.omitted.append(tag)
-            return
-        if self.vector or (tag == "svg" and not self.omitted and not self.in_head):
-            shown = (not self.vector or self.vector[-1][1]) and tag in _SVG_TAGS
-            self.vector.append((tag, shown))
-            if len(self.vector) > 64:
-                raise ValueError("vector nesting exceeds preview limits")
-            if shown:
-                self.parts.append(f"<{tag}{_attributes(_svg_attrs(dict(attrs)))}>")
-                self.has_content = True
-            return
-        if tag in _OMIT_CONTENT:
-            self.omitted.append(tag)
-        if self.omitted:
-            return
         fields = dict(attrs)
-        if self.text_preview:
-            # Native reading uses the user's font and available width, including for wide
-            # newsletter tables. Only link destinations and readable labels are needed.
-            fields = {name: fields[name] for name in ("href", "alt", "dir", "lang") if name in fields}
+        if tag not in _VOID:
+            self.depth += 1
+            if self.depth > 256:
+                raise ValueError("mail markup nesting exceeds preview limits")
+        if self.omitted or tag in _OMIT_CONTENT or (
+                "hidden" in fields or _HIDDEN_STYLE.search(fields.get("style") or "")
+                or self.hidden_classes.intersection((fields.get("class") or "").split())):
+            if tag not in _VOID:
+                self.omitted.append(tag)
+            return
         if tag == "head":
             self.in_head = True
         elif tag == "html":
@@ -182,15 +138,8 @@ class _MailParser(HTMLParser):
 
     def handle_endtag(self, tag):
         tag = _tag_name(tag)
-        if self.vector:
-            for index in range(len(self.vector) - 1, -1, -1):
-                if self.vector[index][0] == tag:
-                    for name, shown in reversed(self.vector[index:]):
-                        if shown:
-                            self.parts.append(f"</{name}>")
-                    del self.vector[index:]
-                    break
-            return
+        if tag not in _VOID:
+            self.depth = max(0, self.depth - 1)
         if self.omitted:
             if self.omitted[-1] == tag:
                 self.omitted.pop()
@@ -204,15 +153,12 @@ class _MailParser(HTMLParser):
             self.parts.append(f"</{tag}>")
 
     def handle_data(self, data):
-        if self.vector:
-            if self.vector[-1] in (("title", True), ("desc", True)):
-                self.parts.append(escape(data, quote=False))
-            return
         if self.omitted:
             return
         if self.in_style:
-            # A permissive browser also accepts end tags like </style foo>.
-            # Never let parser differences reintroduce markup through CSS text.
+            for rule in _CLASS_RULE.finditer(data):
+                if _HIDDEN_STYLE.search(rule[2]):
+                    self.hidden_classes.update(name.strip()[1:] for name in rule[1].split(","))
             self.styles.append(data.replace("</", r"\3c /"))
         elif not self.in_head:
             self.parts.append(escape(data, quote=False))
@@ -251,18 +197,18 @@ def plain_body_html(text):
     return '<div style="white-space:pre-wrap">' + "".join(chunks) + "</div>"
 
 
-def build_mail_html(content: MailBody, image_url: Callable[[str], str | None] | None = None) -> str:
-    """Map images to the browser's local store, or build a resource-free text preview."""
-    parser = _MailParser(text_preview=image_url is None)
+def build_mail_html(content: MailBody, image_url: Callable[[str], str | None]) -> str:
+    """Map mail images to the current document and preserve basic sender formatting."""
+    parser = _MailParser()
     if content.html and len(content.html) <= _MAX_HTML:
         try:
             parser.feed(content.html)
             parser.close()
         except (ValueError, AssertionError, RecursionError):
-            parser = _MailParser(text_preview=image_url is None)
+            parser = _MailParser()
 
     body = []
-    if parser.has_content or (parser.has_image and (image_url is not None or not content.text.strip())):
+    if parser.has_content or parser.has_image:
         mime_base = safe_link(content.base_url) or ""
         base = safe_link(parser.base, mime_base) or mime_base
         mapped = {}
@@ -278,9 +224,6 @@ def build_mail_html(content: MailBody, image_url: Callable[[str], str | None] | 
                 link = target if fragment else safe_link(target, base)
                 if link:
                     attrs.update(href=link, rel="noreferrer")
-            elif image_url is None:
-                body.append(escape(attrs.get("alt") or "［图片］"))
-                continue
             else:
                 source = _image_source(raw, base, content.inline_images)
                 if source:
@@ -289,20 +232,21 @@ def build_mail_html(content: MailBody, image_url: Callable[[str], str | None] | 
                     url = mapped[source]
                     if url and url.startswith("maildesk:"):
                         attrs["src"] = url
-                        if source not in content.inline_images and safe_link(source):
-                            attrs["data-maildesk-image"] = "pending"
-                if "alt" not in attrs and "src" not in attrs:
-                    attrs["alt"] = "图片未能显示"
-                if all(_PIXEL_SIZE.fullmatch(attrs.get(dim, "").strip()) for dim in ("width", "height")):
-                    attrs["data-maildesk-sized"] = ""
+                if "src" not in attrs:
+                    body.append(escape(attrs.get("alt") or "［图片］"))
+                    continue
+                # Qt parses HTML percentage widths as negative pixel sizes. Its
+                # native max-width property resizes the decoded image with the viewport.
+                width = attrs.get("width", "").strip()
+                if re.fullmatch(r"[0-9]{1,3}%", width):
+                    attrs.pop("width")
+                    percent = min(100, int(width[:-1]))
+                    attrs["style"] = f'{attrs.get("style", "")};max-width:{percent}%'
+                if width:
+                    attrs.pop("height", None)
             body.append(f"<{tag}{_attributes(attrs)}>")
     else:
         body.append(plain_body_html(content.text))
-    if image_url is None:
-        return "".join(body)
     return (f'<!doctype html><html{_attributes(parser.html_attrs)}><head><meta charset="utf-8">'
-            f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">'
-            '<meta name="referrer" content="no-referrer">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<style>{_DEFAULT_STYLE}</style>{"".join(parser.styles)}</head>'
             f'<body{_attributes(parser.body_attrs)}>{"".join(body)}</body></html>')

@@ -5,11 +5,10 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from maildesk.demo import DemoVault
 from maildesk.mail_client import MailClient, MailClientError
 from maildesk.models import MailQuery
 from maildesk.service import MailService
-from tests.mail_fixtures import ACCOUNTS, FixtureClient
+from tests.mail_fixtures import ACCOUNTS, FixtureClient, MemoryVault
 
 
 class ImapSearchTests(unittest.TestCase):
@@ -123,11 +122,11 @@ class ImapSearchTests(unittest.TestCase):
         self.assertFalse(result.truncated)
 
 
-class DemoSearchTests(unittest.TestCase):
+class MailServiceSearchTests(unittest.TestCase):
     def test_account_scoped_read_only_search_flags_dates_and_bindings(self):
         with tempfile.TemporaryDirectory() as directory:
             client = FixtureClient()
-            service = MailService(Path(directory) / "demo.sqlite", client, DemoVault())
+            service = MailService(Path(directory) / "demo.sqlite", client, MemoryVault())
             qq, netease = ACCOUNTS
             query = MailQuery(text="二楼阅览室", sender="READER@example.org", unread_only=True)
             with self.assertRaisesRegex(ValueError, "尚未绑定"):

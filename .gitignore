@@ -12,8 +12,3 @@ __pycache__/
 *.db
 *.eml
 *.mbox
-
-# Local walkthrough assets
-/docs/邮件助手界面.png
-/maildesk/assets/reading-room.png
-/maildesk/local_demo_data.py

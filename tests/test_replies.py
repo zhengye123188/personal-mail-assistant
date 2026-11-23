@@ -6,11 +6,10 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import ANY, call, patch
 
-from maildesk.demo import DemoVault
 from maildesk.mail_client import MailClient, MailClientError, ReplyDeliveryUncertain, _parse_body
 from maildesk.models import Account, ReplyEnvelope
 from maildesk.service import MailService
-from tests.mail_fixtures import ACCOUNTS, FixtureClient
+from tests.mail_fixtures import ACCOUNTS, FixtureClient, MemoryVault
 
 
 class ReplyTests(unittest.TestCase):
@@ -115,10 +114,10 @@ class ReplyTests(unittest.TestCase):
             client.send_reply(account, "test-code", reply, "Hello")
         self.assertEqual(connection.send_message.call_count, 2)
 
-    def test_reply_bound_to_message_and_account_and_demo_delivery_is_offline(self):
+    def test_reply_uses_the_original_message_and_account(self):
         with tempfile.TemporaryDirectory() as tmp:
             client = FixtureClient()
-            service = MailService(Path(tmp) / "accounts.db", client, DemoVault())
+            service = MailService(Path(tmp) / "accounts.db", client, MemoryVault())
             qq, netease = ACCOUNTS
             for account in ACCOUNTS:
                 service.bind(account.provider, account.address, "demo")
@@ -133,7 +132,7 @@ class ReplyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 service.send_reply(qq, item, reply, "  \n")
             self.assertEqual(client.sent_replies, [])
-            service.send_reply(qq, item, reply, "演示回复")
+            service.send_reply(qq, item, reply, "测试回复")
             self.assertEqual(len(client.sent_replies), 1)
             self.assertEqual(client.sent_replies[0]["From"], qq.address)
             self.assertEqual(client.sent_replies[0]["To"], reply.recipient)

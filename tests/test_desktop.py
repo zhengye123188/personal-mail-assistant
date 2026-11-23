@@ -10,17 +10,16 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QPushButton
 
-from maildesk.demo import DemoVault
 from maildesk.models import Account, InboxCursor, MailBody, MailPage, PAGE_SIZE
 from maildesk.providers import MAIL_PROVIDERS
 from maildesk.reply_ai import ReplyAI
 from maildesk.service import MailService
 from maildesk.ui import MainWindow
-from tests.mail_fixtures import ACCOUNTS, FixtureClient, PNG
+from tests.mail_fixtures import MemoryVault, ACCOUNTS, FixtureClient, PNG
 
 
 class DelayedInbox(FixtureClient):
@@ -49,8 +48,6 @@ class DelayedInbox(FixtureClient):
 
 
 class DesktopTestCase(unittest.TestCase):
-    demo = True
-
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -59,8 +56,13 @@ class DesktopTestCase(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.client = DelayedInbox()
-        self.service = MailService(Path(directory.name) / "accounts.db", self.client, DemoVault())
-        self.window = MainWindow(self.service, demo=self.demo, simulate_arrival=self.client.simulate_arrival)
+        self.service = MailService(Path(directory.name) / "accounts.db", self.client, MemoryVault())
+        settings = QSettings(str(Path(directory.name) / "models.ini"), QSettings.Format.IniFormat)
+        self.enterContext(patch("maildesk.ui.QSettings", return_value=settings))
+        self.enterContext(patch.dict(os.environ, DEEPSEEK_API_KEY="fixture", DASHSCOPE_API_KEY="fixture"))
+        self.provider = self.enterContext(patch("maildesk.reply_ai._request",
+                                                side_effect=AssertionError("本次操作不应请求模型")))
+        self.window = MainWindow(self.service)
         self.window.show()
 
     def tearDown(self):
@@ -127,7 +129,13 @@ class DesktopTestCase(unittest.TestCase):
         dialog.buttons.button(QDialogButtonBox.StandardButton.Save).click()
         self.wait_until(lambda: self.window.model_settings is None)
 
-    def open_demo_chat(self):
+    def model_replies(self, *values):
+        self.provider.side_effect = [
+            {"choices": [{"message": {"content": value if isinstance(value, str) else json.dumps(value)}}]}
+            for value in values
+        ]
+
+    def open_chat(self):
         self.client.release_qq.set()
         for account in ACCOUNTS:
             self.bind_in_ui(account)
@@ -162,7 +170,7 @@ class DesktopFlowTests(DesktopTestCase):
         self.assertTrue(self.window.close())
         self.window.deleteLater()
         self.client.unavailable.add(qq.address)
-        self.window = MainWindow(self.service, demo=True)
+        self.window = MainWindow(self.service)
         self.window.show()
         self.wait_until(lambda: not self.window.jobs)
         with patch.object(self.client, "read_content", side_effect=AssertionError("不应读取 IMAP")) as read:
@@ -210,39 +218,37 @@ class DesktopFlowTests(DesktopTestCase):
     def test_manual_reply_keeps_separate_drafts_for_same_uid_and_sends_from_original_account(self):
         self.client.release_qq.set()
         qq, netease = ACCOUNTS
-        with patch("maildesk.reply_ai._request") as cloud, patch("maildesk.reply_ai.DemoReplyAI.generate") as demo:
-            for account in ACCOUNTS:
-                self.bind_in_ui(account)
-            first_key, first = self.open_first_reply(qq)
-            self.assertFalse(first.generate_button.isVisible())
-            first.draft.setPlainText("周五我会提前到阅览室。")
-            first.close()
+        for account in ACCOUNTS:
+            self.bind_in_ui(account)
+        first_key, first = self.open_first_reply(qq)
+        self.assertFalse(first.generate_button.isVisible())
+        first.draft.setPlainText("周五我会提前到阅览室。")
+        first.close()
 
-            second_key, second = self.open_first_reply(netease)
-            self.assertEqual(first_key[1:], second_key[1:])
-            self.assertEqual(second.draft.toPlainText(), "")
-            second.draft.setPlainText("评审会议的时间收到了。")
-            second.close()
+        second_key, second = self.open_first_reply(netease)
+        self.assertEqual(first_key[1:], second_key[1:])
+        self.assertEqual(second.draft.toPlainText(), "")
+        second.draft.setPlainText("评审会议的时间收到了。")
+        second.close()
 
-            _, first = self.open_first_reply(qq)
-            self.assertEqual(first.draft.toPlainText(), "周五我会提前到阅览室。")
-            first.close()
-            _, second = self.open_first_reply(netease)
-            self.assertEqual(second.draft.toPlainText(), "评审会议的时间收到了。")
-            self.assertEqual(self.client.sent_replies, [])
-            second.draft.setPlainText("周三下午两点见。")
-            self.show_mailbox("account", qq.address)
-            self.wait_until(lambda: not self.window.jobs)
-            second.send_button.click()
-            self.wait_until(lambda: len(self.client.sent_replies) == 1 and not self.window.jobs)
-            sent = self.client.sent_replies[0]
-            self.assertEqual(sent["From"], netease.address)
-            self.assertEqual(sent["To"], "reviewer@example.org")
-            self.assertEqual(sent.get_content().strip(), "周三下午两点见。")
-            self.assertIn(first_key, self.window.reply_drafts)
-            self.assertEqual([d.item.account for d in self.service.list_drafts()], [qq.address])
-            cloud.assert_not_called()
-            demo.assert_not_called()
+        _, first = self.open_first_reply(qq)
+        self.assertEqual(first.draft.toPlainText(), "周五我会提前到阅览室。")
+        first.close()
+        _, second = self.open_first_reply(netease)
+        self.assertEqual(second.draft.toPlainText(), "评审会议的时间收到了。")
+        self.assertEqual(self.client.sent_replies, [])
+        second.draft.setPlainText("周三下午两点见。")
+        self.show_mailbox("account", qq.address)
+        self.wait_until(lambda: not self.window.jobs)
+        second.send_button.click()
+        self.wait_until(lambda: len(self.client.sent_replies) == 1 and not self.window.jobs)
+        sent = self.client.sent_replies[0]
+        self.assertEqual(sent["From"], netease.address)
+        self.assertEqual(sent["To"], "reviewer@example.org")
+        self.assertEqual(sent.get_content().strip(), "周三下午两点见。")
+        self.assertIn(first_key, self.window.reply_drafts)
+        self.assertEqual([d.item.account for d in self.service.list_drafts()], [qq.address])
+        self.provider.assert_not_called()
 
     def test_toggle_ai_in_settings_updates_open_draft_and_generated_text_can_be_sent_manually(self):
         account = ACCOUNTS[1]
@@ -250,26 +256,26 @@ class DesktopFlowTests(DesktopTestCase):
         _, composer = self.open_first_reply(account)
         composer.draft.setPlainText("先记下我的回复")
         self.assertFalse(composer.generate_button.isVisible())
-        with patch("maildesk.reply_ai._request") as cloud:
-            self.set_ai_enabled(True)
-            self.assertTrue(composer.generate_button.isVisible())
-            self.assertEqual(composer.draft.toPlainText(), "先记下我的回复")
-            composer.instructions.setPlainText("请对方补充信息")
-            composer.generate_button.click()
-            self.wait_until(lambda: composer.draft.toPlainText() != "先记下我的回复" and not self.window.jobs)
-            generated = composer.draft.toPlainText()
-            self.assertTrue(generated.strip())
-            self.assertEqual(self.client.sent_replies, [])
-            self.set_ai_enabled(False)
-            self.assertFalse(composer.generate_button.isVisible())
-            self.assertFalse(composer.instructions.isVisible())
-            self.assertEqual(composer.draft.toPlainText(), generated)
-            composer.draft.setPlainText("请补充下周的会议议程，谢谢。")
-            self.assertTrue(composer.send_button.isEnabled())
-            composer.send_button.click()
-            self.wait_until(lambda: len(self.client.sent_replies) == 1 and not self.window.jobs)
-            self.assertEqual(self.client.sent_replies[0].get_content().strip(), "请补充下周的会议议程，谢谢。")
-            cloud.assert_not_called()
+        self.model_replies({"kind": "draft", "draft": "可以提供下周的会议议程吗？"})
+        self.set_ai_enabled(True)
+        self.assertTrue(composer.generate_button.isVisible())
+        self.assertEqual(composer.draft.toPlainText(), "先记下我的回复")
+        composer.instructions.setPlainText("请对方补充信息")
+        composer.generate_button.click()
+        self.wait_until(lambda: composer.draft.toPlainText() != "先记下我的回复" and not self.window.jobs)
+        generated = composer.draft.toPlainText()
+        self.assertTrue(generated.strip())
+        self.assertEqual(self.client.sent_replies, [])
+        self.set_ai_enabled(False)
+        self.assertFalse(composer.generate_button.isVisible())
+        self.assertFalse(composer.instructions.isVisible())
+        self.assertEqual(composer.draft.toPlainText(), generated)
+        composer.draft.setPlainText("请补充下周的会议议程，谢谢。")
+        self.assertTrue(composer.send_button.isEnabled())
+        composer.send_button.click()
+        self.wait_until(lambda: len(self.client.sent_replies) == 1 and not self.window.jobs)
+        self.assertEqual(self.client.sent_replies[0].get_content().strip(), "请补充下周的会议议程，谢谢。")
+        self.provider.assert_called_once()
 
     def test_chinese_instructions_draft_and_shorten_an_english_reply_from_the_reader(self):
         account = ACCOUNTS[1]
@@ -277,10 +283,12 @@ class DesktopFlowTests(DesktopTestCase):
         self.set_ai_enabled(True)
         original = ("Hi Chen, could you confirm receipt of the agenda for our next meeting?\n\n"
                     "-----Original Message-----\n" + "这里是之前用中文讨论的会议安排。\n" * 12)
-        demo_content = self.client.read_content
+        self.model_replies({"kind": "draft", "draft": "Hi, I have received the agenda. Thank you."},
+                           {"kind": "draft", "draft": "Agenda received, thanks."})
+        read_content = self.client.read_content
 
         def read_english(*args):
-            return replace(demo_content(*args), text=original)
+            return replace(read_content(*args), text=original)
 
         with patch.object(self.client, "read_content", side_effect=read_english):
             _, dialog = self.open_first_reply(account)
@@ -299,6 +307,9 @@ class DesktopFlowTests(DesktopTestCase):
             self.assertIn("received", revised.lower(), dialog.status.text())
             self.assertNotRegex(revised, r"[\u3400-\u9fff]")
             self.assertLess(len(revised), len(first))
+            context = json.loads(self.provider.call_args.args[1]["messages"][-1]["content"])
+            self.assertEqual(context["编辑器内的草稿"], first)
+            self.assertEqual(context["回复语言"]["target"], "en")
             self.assertFalse(self.client.sent_replies)
             dialog.draft.clear()
             dialog.close()
@@ -385,7 +396,14 @@ class DesktopFlowTests(DesktopTestCase):
 
     def test_mail_chat_followup_opens_reply_with_original_context_and_revises_manual_edits(self):
         qq, netease = ACCOUNTS
-        chat = self.open_demo_chat()
+        chat = self.open_chat()
+        self.model_replies(
+            {"action": "search"}, {"parts": [{"text": "两封邮件需要确认。", "sources": [1, 2]}]},
+            {"action": "draft"}, "请问设计评审会议在哪里举行？",
+            {"kind": "answer", "answer": "对方请你确认评审时间。"},
+            {"kind": "draft", "draft": "周三不方便参加，感谢邀请。"},
+            {"kind": "draft", "draft": "周四上午十点见，请带蓝色样稿。"},
+        )
         listed = self.ask_chat(chat, "列出两个邮箱最近的邮件")
         self.assertEqual({m.account for m in listed.sources}, {qq.address, netease.address})
         chosen = listed.sources[1]
@@ -424,6 +442,9 @@ class DesktopFlowTests(DesktopTestCase):
         edited = "你好，\n\n谢谢你的来信。周四上午十点我可以参加。请带上蓝色样稿。"
         dialog.draft.setPlainText(edited)
         revised = submit_instruction(dialog.generate_button, "把这段回复改短一点")
+        submitted = json.loads(self.provider.call_args.args[1]["messages"][-1]["content"])
+        self.assertEqual(submitted["编辑器内的草稿"], edited)
+        self.assertIn("评审", submitted["来信"]["主题"])
         self.assertIn("蓝色样稿", revised.draft)
         self.assertLess(len(revised.draft), len(edited))
         self.assertEqual(dialog.draft.toPlainText(), revised.draft)
@@ -434,7 +455,13 @@ class DesktopFlowTests(DesktopTestCase):
         dialog.close()
 
     def test_chat_drafts_save_before_editing_and_preserve_later_manual_changes(self):
-        chat = self.open_demo_chat()
+        chat = self.open_chat()
+        self.model_replies(
+            {"action": "search"}, {"parts": [{"text": "以下邮件等待回复。", "sources": [1, 2]}]},
+            {"action": "draft"}, "收到下周的安排，我看看时间后再确认。",
+            {"action": "revise"}, "待确认时间。",
+            {"action": "revise"}, "我会确认时间后再回复。",
+        )
         self.ask_chat(chat, "最近有哪些邮件需要回复？")
         first = self.ask_chat(chat, "帮我回第二封")
         self.assertEqual(self.service.list_drafts()[0].text, first.draft_text)
@@ -462,7 +489,12 @@ class DesktopFlowTests(DesktopTestCase):
     def test_late_chat_revision_does_not_restore_a_discarded_draft(self):
         from PySide6.QtWidgets import QMessageBox
 
-        chat = self.open_demo_chat()
+        chat = self.open_chat()
+        self.model_replies(
+            {"action": "search"}, {"parts": [{"text": "以下邮件等待回复。", "sources": [1, 2]}]},
+            {"action": "draft"}, "收到下周的安排，我看看时间后再确认。",
+            {"action": "revise"}, "待确认时间。",
+        )
         self.ask_chat(chat, "最近有哪些邮件需要回复？")
         self.ask_chat(chat, "帮我回第二封")
         jobs = []
@@ -484,12 +516,14 @@ class DesktopFlowTests(DesktopTestCase):
 
     def test_chat_source_opens_cross_account_mail_beyond_first_page(self):
         qq, netease = ACCOUNTS
-        chat = self.open_demo_chat()
+        chat = self.open_chat()
         for _ in range(PAGE_SIZE):
             self.client.simulate_arrival(netease)
         self.show_mailbox("all")
         self.window.refresh_button.click()
         self.wait_until(lambda: not self.window.jobs)
+        self.model_replies({"action": "search", "text": "校样"},
+                           {"parts": [{"text": "有一封校样核对。", "sources": [1]}]})
         result = self.ask_chat(chat, "关于校样的邮件有哪些？")
         self.assertEqual(len(result.sources), 1, result.answer)
         target = result.sources[0]
@@ -672,7 +706,7 @@ class DesktopFlowTests(DesktopTestCase):
             raise ConnectionError("离线")
 
         with patch.object(self.client, "list_messages", side_effect=fetch) as request:
-            self.window = MainWindow(self.service, demo=True)
+            self.window = MainWindow(self.service)
             self.window.show()
             try:
                 self.assertEqual(self.window.mail_list.count(), 6)
@@ -828,15 +862,17 @@ class DesktopFlowTests(DesktopTestCase):
         self.assertEqual(self.window.body.toPlainText(), "")
         self.assertFalse(self.service.list_messages(qq).items[0].unread)
 
-    def test_demo_startup_preview_is_marked_only_when_user_opens_it(self):
+    def test_startup_does_not_read_or_mark_mail_before_user_opens_it(self):
         account = ACCOUNTS[1]
-        self.service.bind(account.provider, account.address, "demo")
+        self.service.bind(account.provider, account.address, "fixture-code")
         self.window.close()
         self.window.deleteLater()
-        self.window = MainWindow(self.service, demo=True)
-        self.window.show()
-        self.wait_until(lambda: not self.window.jobs)
-        self.assertIn("评审", self.window.body.toPlainText())
+        with patch.object(self.client, "read_content", wraps=self.client.read_content) as read:
+            self.window = MainWindow(self.service)
+            self.window.show()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(self.window.body.toPlainText(), "")
+            read.assert_not_called()
         self.assertTrue(self.service.list_messages(account).items[0].unread)
         self.click_message(0)
         self.wait_until(lambda: not self.window.jobs)
@@ -915,7 +951,8 @@ class DesktopFlowTests(DesktopTestCase):
         self.wait_until(lambda: not self.window.jobs)
         self.client.unavailable.add(qq.address)
         self.client.simulate_arrival(qq)
-        self.window.simulate_button.click()  # The selected mailbox is 163.
+        self.client.simulate_arrival(netease)
+        self.window.reminder_timer.timeout.emit()
         self.wait_until(lambda: not self.window.jobs)
         self.show_mailbox("pending")
         self.assertEqual(self.window.mail_list.count(), 1)
@@ -929,12 +966,6 @@ class DesktopFlowTests(DesktopTestCase):
 
 
 class ProviderDesktopTests(DesktopTestCase):
-    demo = False
-
-    def setUp(self):
-        with patch("maildesk.ui.QSettings", return_value=None):
-            super().setUp()
-
     def test_suffix_selection_preserves_local_name_and_shows_provider_instructions(self):
         self.window.findChild(QPushButton, "bindButton").click()
         dialog = self.window.binding

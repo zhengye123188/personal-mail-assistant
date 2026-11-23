@@ -8,10 +8,9 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
-from maildesk.demo import DemoVault
 from maildesk.models import ArrivalBatch, MailItem
 from maildesk.service import MailService
-from tests.mail_fixtures import FixtureClient
+from tests.mail_fixtures import MemoryVault
 
 
 def message(account, uid, subject, preview="", flagged=False, validity="1"):
@@ -25,7 +24,7 @@ class PendingTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "accounts.sqlite"
         self.client = Mock()
-        self.vault = DemoVault()
+        self.vault = MemoryVault()
         self.service = MailService(self.path, self.client, self.vault)
         self.qq = self.service.bind("qq", "me@qq.com", "demo")
         self.netease = self.service.bind("163", "me@163.com", "demo")
@@ -130,19 +129,3 @@ class PendingTests(unittest.TestCase):
         self.assertEqual(self.service.list_pending(), expected)
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT * FROM reads_ahead_of_cursor").fetchall(), [])
-
-    def test_demo_persists_read_flags_across_lists_with_matching_uids(self):
-        client = FixtureClient()
-        first = client.list_messages(self.qq, "demo").items[0]
-        other = client.list_messages(self.netease, "demo").items[0]
-        self.assertEqual(first.uid, other.uid)
-        for invalid in (other, replace(first, validity="old"), replace(first, uid=999)):
-            with self.assertRaises(ValueError):
-                client.mark_read(self.qq, "demo", invalid)
-        client.mark_read(self.qq, "demo", first)
-        client.mark_read(self.qq, "demo", first)
-        self.assertFalse(client.list_messages(self.qq, "demo").items[0].unread)
-        self.assertTrue(client.list_messages(self.netease, "demo").items[0].unread)
-        arrival = client.simulate_arrival(self.qq)
-        client.mark_read(self.qq, "demo", arrival)
-        self.assertFalse(client.scan_arrivals(self.qq, "demo", arrival.validity, arrival.uid - 1).items[0].unread)

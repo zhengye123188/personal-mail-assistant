@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .reply_ai import KEY_ENV, MODELS, PROVIDER_NAMES, DemoReplyAI, ReplyAI
+from .reply_ai import KEY_ENV, MODELS, PROVIDER_NAMES, ReplyAI
 from .service import KeyringVault
 
 
@@ -19,8 +19,6 @@ _KEY_PAGES = {"deepseek": "https://platform.deepseek.com/api_keys",
 
 
 def saved_choice(settings):
-    if settings is None:
-        return OFF
     choice = settings.value("selection", {})
     if isinstance(choice, dict):
         provider, model = choice.get("provider"), choice.get("model")
@@ -33,8 +31,6 @@ def selected_model(choice, settings):
     provider, model = choice
     if provider == "off":
         return None
-    if settings is None:
-        return DemoReplyAI()
     lookup = None
     if settings.value(f"keys/{provider}", False, type=bool):
         lookup = partial(KeyringVault().get, f"reply-api/{provider}")
@@ -70,11 +66,9 @@ class ModelSettingsDialog(QDialog):
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
         self.key.setMaxLength(512)
         form.addRow("API 密钥", self.key)
-        form.setRowVisible(self.key, settings is not None)
         self.key_page = QLabel()
         self.key_page.setOpenExternalLinks(True)
         form.addRow("", self.key_page)
-        form.setRowVisible(self.key_page, settings is not None)
         layout.addWidget(self.fields)
         self.hint = QLabel()
         self.hint.setWordWrap(True)
@@ -106,7 +100,7 @@ class ModelSettingsDialog(QDialog):
             self.model.addItem(label, model)
         if self.choice[0] == provider:
             self.model.setCurrentIndex(max(0, self.model.findData(self.choice[1])))
-        saved = self.settings is not None and self.settings.value(f"keys/{provider}", False, type=bool)
+        saved = self.settings.value(f"keys/{provider}", False, type=bool)
         self.key.setPlaceholderText("已保存，留空继续使用" if saved else f"输入 {PROVIDER_NAMES[provider]} API 密钥")
         self.key_page.setText(f'<a href="{_KEY_PAGES[provider]}">获取 {PROVIDER_NAMES[provider]} API 密钥</a>')
         self._show_mode()
@@ -116,8 +110,6 @@ class ModelSettingsDialog(QDialog):
         self.fields.setVisible(enabled)
         if not enabled:
             text = "普通邮箱模式，可直接阅读、撰写和发送回复。"
-        elif self.settings is None:
-            text = "离线演示使用示例邮箱，可以查信、询问来信内容、修改草稿和模拟发送。"
         else:
             name = PROVIDER_NAMES[self.provider.currentData()]
             text = (f"提问时，{name} 会收到问题、相关对话，以及所选邮箱中相关邮件的主题和正文节选。"
@@ -130,11 +122,11 @@ class ModelSettingsDialog(QDialog):
             return
         provider = self.provider.currentData() if self.enabled.isChecked() else "off"
         model = self.model.currentData() if provider != "off" else ""
-        key = self.key.text().strip() if provider != "off" and self.settings is not None else ""
+        key = self.key.text().strip() if provider != "off" else ""
         if key and (not key.isascii() or not key.isprintable() or " " in key):
             self._show_error("请检查 API 密钥中是否含有空格或非英文字符。")
             return
-        if (self.settings is not None and provider != "off" and not key
+        if (provider != "off" and not key
                 and not os.getenv(KEY_ENV[provider]) and not self.settings.value(f"keys/{provider}", False, type=bool)):
             self._show_error(f"请输入{PROVIDER_NAMES[provider]}的 API 密钥。")
             return
@@ -145,14 +137,13 @@ class ModelSettingsDialog(QDialog):
             if error:
                 self._show_error("系统凭据库未能保存密钥，请解锁凭据库后重试。")
                 return
-            if self.settings is not None:
-                if key:
-                    self.settings.setValue(f"keys/{provider}", True)
-                self.settings.setValue("selection", {"provider": provider, "model": model})
-                self.settings.sync()
-                if self.settings.status() != QSettings.Status.NoError:
-                    self._show_error("无法保存模型设置，请检查本机设置目录的写入权限。")
-                    return
+            if key:
+                self.settings.setValue(f"keys/{provider}", True)
+            self.settings.setValue("selection", {"provider": provider, "model": model})
+            self.settings.sync()
+            if self.settings.status() != QSettings.Status.NoError:
+                self._show_error("无法保存模型设置，请检查本机设置目录的写入权限。")
+                return
             self.choice = provider, model
             self.key.clear()
             self.accept()

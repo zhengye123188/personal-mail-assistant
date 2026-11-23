@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import Mock
 
 from maildesk.compose_assistant import ComposeTurn, compose_draft, compose_turn
-from maildesk.reply_ai import DemoReplyAI, ReplyAIError
+from maildesk.reply_ai import ReplyAIError
 
 
 class ComposeAssistantTests(unittest.TestCase):
@@ -57,15 +57,6 @@ class ComposeAssistantTests(unittest.TestCase):
         self.assertEqual(result.draft, expected)
         self.assertEqual(model.complete.call_count, 2)
 
-    def test_demo_acknowledges_an_english_mail_in_english(self):
-        args = (DemoReplyAI(), "Project update", "Hi Chen, could you confirm receipt of the schedule?")
-        english = compose_draft(*args, "确认收到", "")
-        self.assertRegex(english.draft, r"[A-Za-z]{3}")
-        self.assertNotRegex(english.draft, r"[\u3400-\u9fff]")
-        chinese = compose_draft(*args, "请用中文回复，确认收到", "")
-        self.assertIn("收到", chinese.draft)
-        self.assertNotIn("请用中文", chinese.draft)
-
     def test_questions_only_return_an_answer_even_if_model_adds_draft_content(self):
         model = Mock()
         model.complete.return_value = json.dumps({"kind": "answer", "answer": "对方在确认评审时间。", "draft": "意外字段"})
@@ -113,37 +104,3 @@ class ComposeAssistantTests(unittest.TestCase):
         self.assertIn("收件人", system["content"])
         self.assertEqual(json.loads(user["content"])["本次要求"], brief)
         self.assertTrue(model.complete.call_args.kwargs["json_response"])
-
-    def test_recipient_question_and_question_about_incoming_mail_are_distinct(self):
-        demo = DemoReplyAI()
-        wording = "周五上午可以吗？"
-        args = (demo, "评审", "来信建议在周四下午评审。", wording, "")
-        drafted = compose_draft(*args)
-        answer = compose_turn(*args)
-        self.assertIn(wording, drafted.draft)
-        self.assertNotIn("建议在周四下午", drafted.draft)
-        self.assertIn("周四下午", answer.answer)
-        self.assertIsNone(answer.draft)
-
-    def test_offline_multiline_brief_keeps_the_requested_points_out_of_the_instructions(self):
-        brief = "先谢谢对方邀请。\n周三下午不方便，问问能不能改到周五上午。\n语气礼貌一点，两三句话。"
-        drafted = compose_draft(DemoReplyAI(), "评审", "请确认活动时间。", brief, "")
-        self.assertEqual(drafted.draft, "您好，\n\n谢谢您的邀请。周三下午不方便。请问能不能改到周五上午？")
-
-    def test_offline_unsupported_edits_never_append_editor_instructions_to_the_draft(self):
-        current = "周五上午可以，请在南门见。"
-        for request in ("请用英语回复", "把周五改到下周一", "保留地点",
-                        "不要提地点", "谢谢邀请，删除南门这句", "请帮我把末句换成英文"):
-            with self.subTest(request=request), self.assertRaises(ReplyAIError):
-                compose_draft(DemoReplyAI(), "约见", "请确认时间", request, current)
-
-    def test_offline_walkthrough_uses_the_mail_and_handwritten_edits(self):
-        demo = DemoReplyAI()
-        args = (demo, "评审", "你好，\n\n请确认评审时间，周一上午是否方便？\n\n周宁")
-        first = compose_turn(*args, "对方要我确认什么？", "")
-        self.assertIn("请确认评审时间", first.answer)
-        self.assertIsNone(first.draft)
-        second = compose_draft(*args, "帮我回，周一上午可以", "", (first,))
-        self.assertIn("周一上午可以", second.draft)
-        third = compose_draft(*args, "再简短一点", second.draft + "请在二楼见。", (first, second))
-        self.assertEqual(third.draft, "周一上午可以。请在二楼见。")
