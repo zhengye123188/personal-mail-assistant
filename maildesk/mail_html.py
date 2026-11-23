@@ -106,8 +106,9 @@ def _tag_name(tag):
 
 
 class _MailParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, text_preview=False):
         super().__init__(convert_charrefs=True)
+        self.text_preview = text_preview
         self.parts = []
         self.styles = []
         self.html_attrs = {}
@@ -118,11 +119,15 @@ class _MailParser(HTMLParser):
         self.omitted = []
         self.vector = []
         self.has_content = False
+        self.has_image = False
 
     def handle_starttag(self, tag, attrs):
         tag = _tag_name(tag)
         if len(self.parts) + len(self.styles) >= _MAX_PARTS:
             raise ValueError("mail markup exceeds preview limits")
+        if self.text_preview and tag in {"style", "svg"}:
+            self.omitted.append(tag)
+            return
         if self.vector or (tag == "svg" and not self.omitted and not self.in_head):
             shown = (not self.vector or self.vector[-1][1]) and tag in _SVG_TAGS
             self.vector.append((tag, shown))
@@ -137,6 +142,10 @@ class _MailParser(HTMLParser):
         if self.omitted:
             return
         fields = dict(attrs)
+        if self.text_preview:
+            # Native reading uses the user's font and available width, including for wide
+            # newsletter tables. Only link destinations and readable labels are needed.
+            fields = {name: fields[name] for name in ("href", "alt", "dir", "lang") if name in fields}
         if tag == "head":
             self.in_head = True
         elif tag == "html":
@@ -165,7 +174,7 @@ class _MailParser(HTMLParser):
             elif tag == "img":
                 src = fields.get("src") or fields.get("data-src") or ""
                 self.parts.append((tag, clean, src))
-                self.has_content = True
+                self.has_image = True
             else:
                 if tag == "button":
                     clean["type"] = "button"
@@ -222,7 +231,7 @@ def _image_source(raw, base, inline):
     return safe_link(value, base)
 
 
-def _plain_html(text):
+def plain_body_html(text):
     chunks = []
     offset = 0
     for match in _WEB_IN_TEXT.finditer(text):
@@ -242,18 +251,18 @@ def _plain_html(text):
     return '<div style="white-space:pre-wrap">' + "".join(chunks) + "</div>"
 
 
-def build_mail_html(content: MailBody, image_url: Callable[[str], str | None]) -> str:
-    """Keep template layout, mapping each unique image source to a reader-owned URL."""
-    parser = _MailParser()
+def build_mail_html(content: MailBody, image_url: Callable[[str], str | None] | None = None) -> str:
+    """Map images to the browser's local store, or build a resource-free text preview."""
+    parser = _MailParser(text_preview=image_url is None)
     if content.html and len(content.html) <= _MAX_HTML:
         try:
             parser.feed(content.html)
             parser.close()
         except (ValueError, AssertionError, RecursionError):
-            parser = _MailParser()
+            parser = _MailParser(text_preview=image_url is None)
 
     body = []
-    if parser.has_content:
+    if parser.has_content or (parser.has_image and (image_url is not None or not content.text.strip())):
         mime_base = safe_link(content.base_url) or ""
         base = safe_link(parser.base, mime_base) or mime_base
         mapped = {}
@@ -269,6 +278,9 @@ def build_mail_html(content: MailBody, image_url: Callable[[str], str | None]) -
                 link = target if fragment else safe_link(target, base)
                 if link:
                     attrs.update(href=link, rel="noreferrer")
+            elif image_url is None:
+                body.append(escape(attrs.get("alt") or "［图片］"))
+                continue
             else:
                 source = _image_source(raw, base, content.inline_images)
                 if source:
@@ -285,7 +297,9 @@ def build_mail_html(content: MailBody, image_url: Callable[[str], str | None]) -
                     attrs["data-maildesk-sized"] = ""
             body.append(f"<{tag}{_attributes(attrs)}>")
     else:
-        body.append(_plain_html(content.text))
+        body.append(plain_body_html(content.text))
+    if image_url is None:
+        return "".join(body)
     return (f'<!doctype html><html{_attributes(parser.html_attrs)}><head><meta charset="utf-8">'
             f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">'
             '<meta name="referrer" content="no-referrer">'

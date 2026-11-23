@@ -1,6 +1,8 @@
+import json
 import unittest
+from unittest.mock import Mock
 
-from maildesk.reply_suggestions import reply_suggestions
+from maildesk.reply_suggestions import model_completer, reply_suggestions
 
 
 class ReplySuggestionTests(unittest.TestCase):
@@ -20,6 +22,21 @@ class ReplySuggestionTests(unittest.TestCase):
         self.assertNotIn("周四", moved[0])
         cancelled = reply_suggestions("通知", "下周三上午的会议已取消。")
         self.assertIn("取消", cancelled[0])
+        paused = reply_suggestions("本周安排", "这周项目暂停，本周例会取消，无需参会。")
+        self.assertIn("例会取消", paused[0])
+        self.assertNotIn("邀请", paused[0])
+        moved = reply_suggestions("组会", "组会延期，新时间另行通知。")
+        self.assertIn("改期", moved[0])
+
+    def test_alternative_dates_and_coordinated_requests_keep_both_options(self):
+        question = "面试安排在周四上午十点或者周五下午三点，你更方便哪个时段？"
+        both = reply_suggestions("面试", question)[0]
+        self.assertIn("周四上午十点", both)
+        self.assertIn("周五下午三点", both)
+        requirements = "请在周五 17:00 前核对合同第 8 条的付款期限，并确认开票抬头。"
+        instruction = reply_suggestions("合同", requirements)[0]
+        for fact in ("周五 17:00", "合同第 8 条的付款期限", "确认开票抬头"):
+            self.assertIn(fact, instruction)
 
     def test_specific_requests_and_documents_come_from_the_body(self):
         proof = reply_suggestions("校样已更新", "请特别留意第二段里的作品名称，其他修改我们已核对。")
@@ -51,6 +68,9 @@ class ReplySuggestionTests(unittest.TestCase):
         self.assertNotIn("unsubscribe", result[0])
         comment = reply_suggestions(subject, "Octo commented:\nPlease include the empty inbox case.\n" + footer)
         self.assertIn("empty inbox", comment[0])
+        long_comment = "Could you add a test for empty invoices and document the new date format?"
+        result = reply_suggestions(subject, long_comment + "\n" + footer)
+        self.assertIn("empty invoices and document the new date format", result[0])
         review = reply_suggestions(subject, "Octo requested your review.\n" + footer)
         self.assertIn("Fix the badge counter", review[0])
 
@@ -63,9 +83,31 @@ class ReplySuggestionTests(unittest.TestCase):
                 self.assertNotIn("邀请", "".join(result))
 
     def test_no_reply_and_authentication_messages_do_not_offer_completions(self):
+        for address in ("noreply@service.test", "Do-Not-Reply@service.test"):
+            self.assertEqual(reply_suggestions("开票通知", "发票于今日开出。", address), ())
+            self.assertIsNone(model_completer(Mock(), "开票通知", "发票于今日开出。", address))
         for subject, body in (("登录验证码 123456", "七分钟内有效"), ("通知", "此邮件无需回复。"),
                               ("活动汇总", "请查看详情。\n--\n此邮箱无人值守。点击退订"),
                               ("电子通行证", "您的验证码为123456，请妥善保管。"),
                               ("Sign in", "Your verification code is 123456")):
             with self.subTest(subject=subject, body=body):
                 self.assertEqual(reply_suggestions(subject, body), ())
+
+    def test_model_completion_is_grounded_in_latest_mail_and_uses_user_prefix(self):
+        model = Mock()
+        model.complete.return_value = json.dumps({"suffix": "参加周三的接口评审，问问能否改期。",
+                                                  "evidence": "周三的接口评审"})
+        complete = model_completer(model, "接口方案", "周三的接口评审能参加吗？\nOn Monday, Ana wrote:\n旧报价不可见")
+        self.assertEqual(complete("我不方便"), "参加周三的接口评审，问问能否改期。")
+        messages = model.complete.call_args.args[0]
+        payload = json.loads(messages[-1]["content"])
+        self.assertEqual(payload["已输入"], "我不方便")
+        self.assertIn("周三的接口评审", payload["最新正文"])
+        self.assertNotIn("旧报价", payload["最新正文"])
+        for suffix, quote in (("参加周三的接口评审。", "虚构来源"), ("改到17:00。", "接口评审"),
+                              ("参加评审，但已付款。", "接口评审"),
+                              ("我不方便参加。", "接口评审")):
+            model.complete.return_value = json.dumps({"suffix": suffix, "evidence": quote})
+            self.assertEqual(complete("我不方便"), "")
+        self.assertIsNone(model_completer(model, "验证码 123456", "请在网页输入"))
+        self.assertIsNone(model_completer(model, "通知", "此邮箱无人值守，请勿回复。"))

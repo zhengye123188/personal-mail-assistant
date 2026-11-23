@@ -1,7 +1,6 @@
 import os
 import unittest
 from concurrent.futures import CancelledError
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -11,6 +10,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from maildesk.chat_dialog import ChatDialog
+from maildesk.mail_chat import ChatTurn
 from maildesk.models import Account, MailItem
 
 
@@ -25,7 +25,7 @@ class ChatDialogTests(unittest.TestCase):
         self.accounts = (self.qq, self.netease)
         self.item = MailItem(self.qq.address, "42", 1, "<b>周五 & 读书会</b>", "王琳",
                              self.qq.address, "2026-11-23", 123)
-        self.turn = SimpleNamespace(question="查询活动", answer="读书会定在周五。[1]",
+        self.turn = ChatTurn(question="查询活动", answer="读书会定在周五。[1]",
                                     sources=(self.item,), draft_item=None, draft_text="")
         self.ask = Mock(return_value=self.turn)
         self.jobs = []
@@ -64,7 +64,7 @@ class ChatDialogTests(unittest.TestCase):
         source.click()
         self.assertEqual(opened, [self.item])
 
-        followup = SimpleNamespace(question="帮我回复第一封", answer="草稿已准备好。",
+        followup = ChatTurn(question="帮我回复第一封", answer="草稿已准备好。",
                                    sources=(self.item,), draft_item=self.item, draft_text="谢谢邀请，周五见。")
         self.ask.return_value = followup
         d.input.setPlainText(followup.question)

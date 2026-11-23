@@ -159,6 +159,83 @@ class ReplyDialogTests(unittest.TestCase):
         self.assertEqual(editor.toPlainText(), "请确认付款金额。")
         self.assertEqual(self.jobs, [])
 
+    def test_model_completion_waits_for_opt_in_and_follows_the_latest_prefix(self):
+        complete = Mock(side_effect=lambda prefix: "参加周三的评审。" if prefix == "我不方便" else "确认需求。")
+        d = self.make_dialog(generate=self.generate, complete=complete, suggestions=("核对规格书。",))
+        self.app.processEvents()
+        field = d.instructions
+        d._fetch_completion()
+        self.assertFalse(self.jobs)
+        changes = QSignalSpy(d.model_completion_toggled)
+        d.model_completion.click()
+        self.assertEqual(changes.at(0), [True])
+        d._fetch_completion()
+        first_work, first_done = self.jobs.pop()
+        self.assertEqual(first_work(), "确认需求。")
+        field.insertPlainText("我不方便")
+        d._fetch_completion()
+        self.assertFalse(self.jobs)
+        first_done("确认需求。", None)
+        self.assertFalse(field.completion_suffix)
+        self.assertTrue(d._completion_timer.isActive())
+        d._fetch_completion()
+        self.finish()
+        self.assertEqual(field.toPlainText(), "我不方便")
+        self.assertEqual(field.completion_suffix, "参加周三的评审。")
+        QTest.keyClick(field, Qt.Key.Key_Tab)
+        self.assertEqual(field.toPlainText(), "我不方便参加周三的评审。")
+        self.assertFalse(d.draft.toPlainText())
+        self.generate.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_disabling_or_closing_completion_discards_pending_result(self):
+        complete = Mock(return_value="请确认周五的报价。")
+        d = self.make_dialog(generate=self.generate, complete=complete, suggestions=("核对预算。",))
+        self.app.processEvents()
+        for closing in (False, True):
+            d.model_completion.setChecked(True)
+            d._fetch_completion()
+            work, done = self.jobs.pop()
+            if closing:
+                d.close()
+            else:
+                d.model_completion.setChecked(False)
+            self.assertEqual(work(), "")
+            done("不应显示的其他内容", None)
+            self.assertEqual(d.instructions.completion_suffix, "核对预算。")
+        complete.assert_not_called()
+
+    def test_model_failure_keeps_local_suggestion_and_ime_blocks_requests(self):
+        d = self.make_dialog(generate=self.generate, complete=Mock(), suggestions=("核对合同第八条。",))
+        self.app.processEvents()
+        d.model_completion.setChecked(True)
+        QApplication.sendEvent(d.instructions, QInputMethodEvent("he", []))
+        d._fetch_completion()
+        self.assertFalse(self.jobs)
+        commit = QInputMethodEvent()
+        commit.setCommitString("核对")
+        QApplication.sendEvent(d.instructions, commit)
+        d._fetch_completion()
+        self.finish(ConnectionError("offline"))
+        self.assertEqual(d.instructions.completion_suffix, "合同第八条。")
+
+    def test_switching_visible_mail_windows_only_completes_the_active_message(self):
+        other = self.make_dialog(generate=self.generate, complete=Mock(return_value="核对合同。"))
+        self.app.processEvents()
+        other.model_completion.setChecked(True)
+        other._fetch_completion()
+        old_work, old_done = self.jobs.pop()
+        active = self.make_dialog(generate=self.generate, complete=Mock(return_value="确认评审安排。"))
+        self.app.processEvents()
+        active.model_completion.setChecked(True)
+        other._fetch_completion()
+        self.assertFalse(self.jobs)
+        active._fetch_completion()
+        self.finish()
+        old_done(old_work(), None)
+        self.assertEqual(active.instructions.completion_suffix, "确认评审安排。")
+        self.assertFalse(other.instructions.completion_suffix)
+
     def test_edits_survive_late_generation_and_errors(self):
         d = self.dialog
         d.set_model("本机模型 A", self.generate)

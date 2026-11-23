@@ -4,6 +4,7 @@ from urllib.parse import unquote
 
 
 PAGE_SIZE = 40
+DRAFT_CONTEXT_LIMIT = 32_768
 
 
 def normalize_cid(source: str) -> str:
@@ -50,6 +51,16 @@ class MailItem:
     preview: str = ""
     unread: bool | None = None
     flagged: bool | None = None
+
+
+@dataclass(frozen=True)
+class ReplyDraft:
+    item: MailItem
+    envelope: ReplyEnvelope | None
+    original_text: str
+    text: str
+    instructions: str = ""
+    updated_at: float = 0.0
 
 
 @dataclass(frozen=True)

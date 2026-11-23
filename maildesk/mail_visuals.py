@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 
 _SYMBOLS = {
+    "draft": '<path d="M5 3.5h9l5 5v12H5z"/><path d="M14 3.5v5h5M8 12h8m-8 4h6"/>',
+    "trash": '<path d="M4 6h16M9 6V3.5h6V6M6 6l1 14h10l1-14M10 9v8m4-8v8"/>',
     "inbox": '<path d="M3 13.5 6.5 6h11l3.5 7.5v4.2a1.8 1.8 0 0 1-1.8 1.8H4.8A1.8 1.8 0 0 1 3 17.7z"/><path d="M3.5 13.5h4.9l1.4 2.7h4.4l1.4-2.7h4.9"/>',
     "sidebar": '<rect x="2.8" y="4.2" width="18.4" height="15.6" rx="3"/><path d="M10 4.6v14.8M5.6 8.3h1.6m-1.6 3h1.6"/>',
     "search": '<circle cx="10.4" cy="10.4" r="6.2"/><path d="m15 15 5 5"/>',

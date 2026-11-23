@@ -1,18 +1,24 @@
 """Local account metadata and access to mail through OS-managed credentials."""
 
+import json
 import re
 import sqlite3
 import sys
+import time
+from concurrent.futures import Future
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from threading import RLock
 
-from .models import Account, InboxCursor, MailBody, MailItem, MailPage, MailQuery, MailSearchResult, ReplyEnvelope
+from .models import (
+    DRAFT_CONTEXT_LIMIT, Account, InboxCursor, MailBody, MailItem, MailPage, MailQuery, MailSearchResult,
+    ReplyDraft, ReplyEnvelope,
+)
+from .mail_cache import MailCache
+from .providers import MAIL_PROVIDERS, provider_for_address
 
 
-_DOMAINS = {"qq": "qq.com", "163": "163.com"}
-_LOCAL_PART = re.compile(r"[a-z0-9_+%-]+(?:[.][a-z0-9_+%-]+)*", re.ASCII)
 _NON_ACTION_SUBJECT = re.compile(
     r"验证码|动态口令|优惠券|限时促销|\b(?:verification code|one[- ]time (?:code|password)|flash sale)\b", re.I,
 )
@@ -71,11 +77,11 @@ class KeyringVault:
 def _account(provider: str, address: str) -> Account:
     provider = provider.strip().lower()
     address = address.strip().lower()
-    if provider not in _DOMAINS:
-        raise ValueError("请选择 QQ 邮箱或网易 163 邮箱。")
-    local, _, domain = address.partition("@")
-    if domain != _DOMAINS[provider] or not _LOCAL_PART.fullmatch(local) or len(local) > 64:
-        raise ValueError(f"请输入有效的 @{_DOMAINS[provider]} 邮箱地址。")
+    if provider not in MAIL_PROVIDERS:
+        raise ValueError("请选择支持的邮箱服务商。")
+    if provider_for_address(address) != provider:
+        domains = "、".join(f"@{domain}" for domain in MAIL_PROVIDERS[provider].domains)
+        raise ValueError(f"请输入有效的邮箱地址（{domains}）。")
     return Account(address=address, provider=provider)
 
 
@@ -86,6 +92,8 @@ class MailService:
         self._client = client
         self._vault = vault
         self._lock = RLock()
+        self._content_requests = {}
+        self._cache = MailCache(self._db_path.with_suffix(".cache.sqlite3"))
         with closing(self._connect()) as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS accounts "
@@ -110,6 +118,14 @@ class MailService:
                     PRIMARY KEY (account, validity, uid)
                 )
             """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS reply_drafts (
+                    account TEXT NOT NULL, validity TEXT NOT NULL, uid INTEGER NOT NULL,
+                    item_json TEXT NOT NULL, envelope_json TEXT,
+                    original_text TEXT NOT NULL, text TEXT NOT NULL, instructions TEXT NOT NULL,
+                    updated_at REAL NOT NULL, PRIMARY KEY (account, validity, uid)
+                )
+            """)
             db.commit()
 
     def _connect(self):
@@ -124,7 +140,12 @@ class MailService:
     def bind(self, provider: str, address: str, secret: str) -> Account:
         account = _account(provider, address)
         if not secret or not secret.strip():
-            raise ValueError("请输入邮箱的客户端授权码。")
+            raise ValueError(f"请输入{MAIL_PROVIDERS[account.provider].credential_label}。")
+        if account.provider == "gmail":
+            # Google displays the 16-character password in four groups when copying.
+            secret = re.sub(r"[ \u00a0\u202f]", "", secret.strip())
+            if not re.fullmatch(r"[A-Za-z0-9]{16}", secret):
+                raise ValueError("请输入 Google 账号生成的 16 位应用专用密码。")
         self._client.verify(account, secret)
         with self._lock, closing(self._connect()) as db:
             # Reserve the write before changing the vault so competing bindings
@@ -149,21 +170,34 @@ class MailService:
                 raise
         return account
 
-    def _credentials(self, account: Account) -> str:
-        with self._lock, closing(self._connect()) as db:
+    def _require_bound(self, account: Account) -> None:
+        with closing(self._connect()) as db:
             row = db.execute(
                 "SELECT provider FROM accounts WHERE address = ?", (account.address,)
             ).fetchone()
             if row != (account.provider,) or _account(account.provider, account.address) != account:
                 raise ValueError("该邮箱账号尚未绑定。")
+
+    def _credentials(self, account: Account) -> str:
+        with self._lock:
+            self._require_bound(account)
             secret = self._vault.get(account.address)
         if not secret:
-            raise ValueError("系统凭据库中没有该邮箱的授权码，请重新绑定。")
+            label = MAIL_PROVIDERS[account.provider].credential_label
+            raise ValueError(f"系统凭据库中没有该邮箱的{label}，请重新绑定。")
         return secret
 
     def list_messages(self, account: Account, before_uid: InboxCursor | int | None = None) -> MailPage:
+        started = time.time_ns()
         secret = self._credentials(account)
-        return self._client.list_messages(account, secret, before_uid)
+        page = self._client.list_messages(account, secret, before_uid)
+        if before_uid is None:
+            self._cache.save_page(account.address, page, started)
+        return page
+
+    def cached_first_page(self, account: Account) -> MailPage | None:
+        self._require_bound(account)
+        return self._cache.first_page(account.address)
 
     def search_mail(self, account: Account, query: MailQuery, limit: int = 10) -> MailSearchResult:
         if type(limit) is not int or not 1 <= limit <= 40:
@@ -173,17 +207,49 @@ class MailService:
     def read_body(self, account: Account, item: MailItem) -> str:
         if item.account != account.address:
             raise ValueError("该邮件属于另一个邮箱。")
+        self._require_bound(account)
+        cached = self._cache.body((account.address, item.validity, item.uid))
+        if cached is not None:
+            return cached.text
         secret = self._credentials(account)
         return self._client.read_body(account, secret, item)
 
     def read_content(self, account: Account, item: MailItem) -> MailBody:
         if item.account != account.address:
             raise ValueError("该邮件属于另一个邮箱。")
-        body = self._client.read_content(account, self._credentials(account), item)
-        if body.reply:
-            source = (account.address, item.validity, item.uid)
-            body = replace(body, reply=replace(body.reply, source=source))
-        return body
+        self._require_bound(account)
+        key = (account.address, item.validity, item.uid)
+        with self._lock:
+            pending = self._content_requests.get(key)
+            if pending is None:
+                request = self._content_requests[key] = Future()
+        if pending is not None:
+            return pending.result()
+        try:
+            body = self._cache.body(key)
+            if body is None:
+                body = self._client.read_content(account, self._credentials(account), item)
+                if body.reply:
+                    body = replace(body, reply=replace(body.reply, source=key))
+                self._cache.save_body(key, body)
+            request.set_result(body)
+            return body
+        except BaseException as exc:
+            request.set_exception(exc)
+            raise
+        finally:
+            with self._lock:
+                del self._content_requests[key]
+
+    def read_images(self, item, urls, download, *, retry=False, cancelled):
+        key = (item.account, item.validity, item.uid)
+        images = {} if retry else self._cache.images(key, urls)
+        missing = [url for url in urls if url not in images]
+        if missing and not cancelled():
+            fresh = download(tuple(missing), cancelled=cancelled)
+            self._cache.save_images(key, fresh)
+            images.update(fresh)
+        return images
 
     def send_reply(self, account: Account, item: MailItem, envelope: ReplyEnvelope, text: str) -> None:
         if (item.account != account.address or not envelope
@@ -193,11 +259,70 @@ class MailService:
             raise ValueError("请先填写回复正文。")
         self._client.send_reply(account, self._credentials(account), envelope, text)
 
+    def save_draft(self, draft: ReplyDraft) -> ReplyDraft:
+        item = draft.item
+        key = (item.account, item.validity, item.uid)
+        if draft.envelope and draft.envelope.source != key:
+            raise ValueError("草稿的回复地址与原邮件不匹配。")
+        if not (draft.text.strip() or draft.instructions.strip()):
+            self.delete_draft(item)
+            return draft
+        # Keep enough of the source for offline editing, including after an inbox UID reset.
+        draft = replace(draft, original_text=draft.original_text[:DRAFT_CONTEXT_LIMIT], updated_at=time.time())
+        item_json = json.dumps(asdict(item), ensure_ascii=False)
+        envelope_json = json.dumps(asdict(draft.envelope), ensure_ascii=False) if draft.envelope else None
+        with closing(self._connect()) as db:
+            if not db.execute("SELECT 1 FROM accounts WHERE address=?", (item.account,)).fetchone():
+                raise ValueError("草稿的发件账号尚未绑定。")
+            db.execute("""
+                INSERT INTO reply_drafts
+                    (account, validity, uid, item_json, envelope_json, original_text, text, instructions, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account, validity, uid) DO UPDATE SET
+                    item_json=excluded.item_json, envelope_json=excluded.envelope_json,
+                    original_text=excluded.original_text, text=excluded.text,
+                    instructions=excluded.instructions, updated_at=excluded.updated_at
+            """, (*key, item_json, envelope_json, draft.original_text, draft.text, draft.instructions, draft.updated_at))
+            db.commit()
+        return draft
+
+    def list_drafts(self, *, include_original=True) -> list[ReplyDraft]:
+        original = "original_text" if include_original else "''"
+        with closing(self._connect()) as db:
+            rows = db.execute(f"""
+                SELECT item_json, envelope_json, {original}, text, instructions, updated_at
+                FROM reply_drafts ORDER BY updated_at DESC, account, validity, uid DESC
+            """)
+            drafts = []
+            for item_json, envelope_json, original, text, instructions, updated_at in rows:
+                item = MailItem(**json.loads(item_json))
+                envelope = None
+                if envelope_json:
+                    fields = json.loads(envelope_json)
+                    fields["references"] = tuple(fields["references"])
+                    fields["source"] = tuple(fields["source"])
+                    envelope = ReplyEnvelope(**fields)
+                drafts.append(ReplyDraft(item, envelope, original, text, instructions, updated_at))
+            return drafts
+
+    def original_for_draft(self, item: MailItem) -> str:
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT original_text FROM reply_drafts WHERE account=? AND validity=? AND uid=?",
+                             (item.account, item.validity, item.uid)).fetchone()
+            return row[0] if row else ""
+
+    def delete_draft(self, item: MailItem) -> None:
+        with closing(self._connect()) as db:
+            db.execute("DELETE FROM reply_drafts WHERE account=? AND validity=? AND uid=?",
+                       (item.account, item.validity, item.uid))
+            db.commit()
+
     def mark_read(self, account: Account, item: MailItem) -> None:
         if item.account != account.address:
             raise ValueError("该邮件属于另一个邮箱。")
         secret = self._credentials(account)
         self._client.mark_read(account, secret, item)
+        self._cache.mark_read(item)
         key = (account.address, item.validity, item.uid)
         with closing(self._connect()) as db:
             db.execute("UPDATE pending_mail SET unread=0 WHERE account=? AND validity=? AND uid=?", key)

@@ -97,6 +97,11 @@ def demo_foreign_draft(target, subject, body, instruction, current="", *, conver
         raise _unsupported()
 
     if brief and brief in (suggestion.rstrip("。") for suggestion in reply_suggestions(subject, body)):
+        if target == "en" and brief.startswith("确认收到 ") and " 的时间提议" in brief:
+            slots = brief.removeprefix("确认收到 ").partition(" 的时间提议")[0].replace(" 或 ", " or ")
+            return f"Hello,\n\nThank you for checking. I'll check my availability for {slots} and get back to you."
+        if target == "en" and brief.startswith("回应对方提出的"):
+            return examples["context"]
         if brief.startswith("告诉对方已看到「") and brief.endswith("问问是否有补充背景"):
             return examples["context"]
         if brief.startswith(("告诉对方已看到来信提到的「", "谢谢对方的反馈，告诉对方已看到关于「")):

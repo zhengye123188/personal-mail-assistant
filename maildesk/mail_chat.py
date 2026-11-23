@@ -5,7 +5,8 @@ from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from .models import MailItem, MailQuery
+from .models import DRAFT_CONTEXT_LIMIT, MailItem, MailQuery, ReplyDraft
+from .providers import MAIL_PROVIDERS
 from .reply_ai import DemoReplyAI, ReplyAIError, structured_completion
 from .service import _needs_attention
 
@@ -18,6 +19,7 @@ class ChatTurn:
     draft_item: MailItem | None = None
     draft_text: str = ""
     scope: tuple[str, ...] = ()
+    draft_record: ReplyDraft | None = None
 
 
 _PLAN = """你是个人邮件助手的检索规划器。将当前问题编译为一个只读操作。输出 JSON 对象：
@@ -31,6 +33,8 @@ clarify 用于无法确定意图或与邮箱无关的问题。不可发信或改
 text 是邮件里可能逐字出现的关键词，不要把整句问题、泛指的“邮件/未读/需要回复”当关键词。
 sender 是用户想匹配的发件人。attention 表示找需要用户处理或回复的来信，不等于仅有旗标或未读。
 accounts 是本次授权邮箱的序号，省略或 [] 代表全部；用户指定邮箱则只选对应项。
+用户按服务商限定收件箱时，选择该服务商的所有匹配账号；指定完整地址时，只选择该账号。
+指定的收件箱不在可查询邮箱中时返回 clarify。用户描述的发件人或关键词不限制收件箱。
 refs 只用于指向对话里已经展示过的邮件。使用所给 key 如 "2:1"（第2轮的第1项）；
 “第二封”指最近一轮结果中的第2项。“这封”指最近明确选定的一封。找新邮件时 refs 为空。
 如果用户没指明回复哪封且对话中有多个候选，不要擅自选其中一封。
@@ -123,7 +127,11 @@ def _demo_plan(question, accounts, history, today):
         action = "context"
     plan = {"action": action, "attention": bool(re.search(r"待办|待处理|需要.{0,4}回|要我回|待回复", q)),
             "unread_only": "未读" in q, "flagged_only": "旗标" in q}
-    providers = [p for p in ("qq", "163") if p in q]
+    providers = []
+    for code, profile in MAIL_PROVIDERS.items():
+        names = "|".join(re.escape(name) for name in (code, *profile.domains))
+        if re.search(rf"(?<![a-z0-9_@.])(?:{names})(?![a-z0-9_.])", q):
+            providers.append(code)
     if providers:
         plan["accounts"] = [i for i, a in enumerate(accounts, 1) if a.provider in providers]
         if not plan["accounts"]:
@@ -216,8 +224,10 @@ class MailChat:
         if demo:
             plan = _demo_plan(question, accounts, memory, day)
         else:
-            plan = structured_completion(self.model, _PLAN, {"今天": str(day), "问题": question, "近期对话": memory,
-                                                             "可查询邮箱": {i: a.address for i, a in enumerate(accounts, 1)}})
+            mailboxes = {i: {"地址": account.address, "服务商": MAIL_PROVIDERS[account.provider].name}
+                         for i, account in enumerate(accounts, 1)}
+            plan = structured_completion(self.model, _PLAN, {"今天": str(day), "问题": question,
+                                                            "近期对话": memory, "可查询邮箱": mailboxes})
         _check(cancelled)
         action = plan.get("action")
         if action == "context":
@@ -282,11 +292,11 @@ class MailChat:
                 items.sort(key=_attention, reverse=True)
         _check(cancelled)
 
-        def finish(text, sources=(), draft_item=None, draft_text=""):
+        def finish(text, sources=(), draft_item=None, draft_text="", draft_record=None):
             _check(cancelled)
             note = " ".join(dict.fromkeys(notices))
             return ChatTurn(question, text + ("\n\n" + note if note else ""), tuple(sources), draft_item, draft_text,
-                            tuple(allowed))
+                            tuple(allowed), draft_record)
 
         if not items:
             return finish("本次查询没有取得匹配的邮件。")
@@ -298,15 +308,17 @@ class MailChat:
             notices.append(f"本轮分析了 {limit} 封候选邮件，可以缩小日期或关键词范围继续查找。")
         items = items[:limit]
         evidence = []
-        draft_body = None
+        reply_content = None
         for i, item in enumerate(items, 1):
             _check(cancelled)
             body = ""
             if detailed:
                 try:
-                    body = self.service.read_body(allowed[item.account], item)
                     if action in ("draft", "revise"):
-                        draft_body = body
+                        reply_content = self.service.read_content(allowed[item.account], item)
+                        body = reply_content.text
+                    else:
+                        body = self.service.read_body(allowed[item.account], item)
                 except (ValueError, RuntimeError, OSError):
                     notices.append(f"《{item.subject[:80]}》正文读取失败，仅取得列表信息。")
             evidence.append({"编号": i, **_source_card(item), "摘要": item.preview[:600],
@@ -314,7 +326,7 @@ class MailChat:
         _check(cancelled)
         if action in ("draft", "revise"):
             item = items[0]
-            if draft_body is None or (not draft_body.strip() and item.subject.strip() in ("", "（无主题）")):
+            if reply_content is None or (not reply_content.text.strip() and item.subject.strip() in ("", "（无主题）")):
                 return finish("这封邮件暂时没有可供起草回复的正文。", items)
             conversation = [{"用户": turn["问题"], "助手": turn["答复"],
                              "引用主题": [card["主题"][:100] for card in turn["来源"]]} for turn in memory]
@@ -323,12 +335,13 @@ class MailChat:
                                   and _identity(turn.draft_item) == _identity(item)
                                   and set(turn.scope).issubset(allowed)]
             try:
-                draft = self.model.generate(item.subject, draft_body, question, previous_draft=previous_draft,
+                draft = self.model.generate(item.subject, reply_content.text, question, previous_draft=previous_draft,
                                             conversation=conversation, prior_instructions=prior_instructions)
             except ReplyAIError as exc:
                 return finish(f"已找到原邮件，生成草稿失败。{exc}", items)
             answer = "已按本轮要求修改 [1] 的回复草稿。" if previous_draft else "已为 [1] 起草回复。可打开编辑窗口核对内容和收件人。"
-            return finish(answer, items, item, draft)
+            record = ReplyDraft(item, reply_content.reply, reply_content.text[:DRAFT_CONTEXT_LIMIT], draft)
+            return finish(answer, items, item, draft, record)
 
         try:
             parts = _conclusions(self.model, question, evidence, memory, demo, attention)

@@ -22,7 +22,7 @@ from .models import MailBody, normalize_cid
 _ORIGIN = "maildesk://message"
 _MAX_IMAGE_BYTES = 48 * 1024 * 1024
 
-# Qt registers schemes process-wide, before QApplication is constructed.
+# Register before creating the first WebEngine profile; text-only windows never import this module.
 _scheme = QWebEngineUrlScheme(b"maildesk")
 _scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
 _scheme.setFlags(QWebEngineUrlScheme.Flag.SecureScheme)
@@ -192,6 +192,13 @@ class WebMailView(QWebEngineView):
 
     def clear(self):
         self.setPlainText("")
+
+    def release_document(self):
+        """Drop pending image requests and bytes when the native text page takes over."""
+        self.stop()
+        self._store.reset()
+        self._uses_html = False
+        self._text = ""
 
     def toPlainText(self):
         return self._text

@@ -9,9 +9,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from .body_view import MessageBodyView
 from .mail_visuals import icon, sender_display
 from .models import MailBody, MailItem
-from .web_reader import WebMailView
 
 
 def _font(widget, pixels, weight=QFont.Weight.Normal):
@@ -201,7 +201,7 @@ class ReaderPane(QWidget):
         notice_row.addWidget(self.image_notice)
         layout.addLayout(notice_row)
 
-        self.body = WebMailView(pane)
+        self.body = MessageBodyView(pane)
         self.body.setObjectName("bodyText")
         layout.addWidget(self.body, 1)
         self.retry = QPushButton("重新读取正文", pane)

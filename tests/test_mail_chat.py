@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 from maildesk.demo import DemoVault
 from maildesk.mail_chat import ChatTurn, MailChat
-from maildesk.models import MailItem, MailSearchResult
+from maildesk.models import Account, MailBody, MailItem, MailSearchResult
 from maildesk.reply_ai import DemoReplyAI, ReplyAI, ReplyAIError
 from maildesk.service import MailService
 from tests.mail_fixtures import ACCOUNTS, FixtureClient
@@ -32,7 +32,7 @@ class MailChatTests(unittest.TestCase):
         first_reply = ChatTurn("用日语回复，确认收到", "已起草", (first,), first, "ご連絡ありがとうございます。")
         second_reply = ChatTurn("用法语回复，确认收到", "已起草", (second,), second, "Merci pour votre invitation.")
         service = Mock()
-        service.read_body.return_value = "Hello, could you confirm that you received the invitation?"
+        service.read_content.return_value = MailBody("Hello, could you confirm that you received the invitation?")
         model = ReplyAI(provider="deepseek", key_lookup=lambda: "fixture")
         model.complete = Mock(side_effect=[json.dumps({"action": "revise", "refs": ["1:1"]}),
                                            "ご連絡をいただきありがとうございます。"])
@@ -47,7 +47,7 @@ class MailChatTests(unittest.TestCase):
         item = mail(QQ, "Meeting invitation")
         service = Mock()
         service.search_mail.return_value = MailSearchResult([item], False)
-        service.read_body.return_value = ""
+        service.read_content.return_value = MailBody("")
         reply = MailChat(service, DemoReplyAI()).ask("帮我回，确认收到", [QQ])
         self.assertEqual(reply.draft_item, item)
         self.assertIn("received", reply.draft_text)
@@ -99,18 +99,18 @@ class MailChatTests(unittest.TestCase):
         previous = ChatTurn("查邮件", "上轮含有 QQ 私有信息", (a, b), scope=(QQ.address, NETEASE.address))
         outputs(model, {"action": "draft", "refs": ["1:1"]})
         model.generate.return_value = "好，周五见。"
-        service.read_body.return_value = "周五见？"
+        service.read_content.return_value = MailBody("周五见？")
         chat = MailChat(service, model)
         result = chat.ask("帮我回第二封", ACCOUNTS, [previous])
         self.assertEqual(result.draft_item, b)
-        service.read_body.assert_called_once_with(NETEASE, b)
+        service.read_content.assert_called_once_with(NETEASE, b)
         service.search_mail.assert_not_called()
         service.send_reply.assert_not_called()
         outputs(model, {"action": "read", "refs": ["1:1"]})
         result = chat.ask("第一封说什么", [NETEASE], [previous])
         self.assertFalse(result.sources)
         self.assertNotIn("私有", model.complete.call_args.args[0][1]["content"])
-        self.assertEqual(service.read_body.call_count, 1)
+        self.assertEqual(service.read_content.call_count, 1)
 
     def test_ambiguous_draft_and_missing_body_do_not_generate(self):
         service, model = Mock(), Mock()
@@ -122,7 +122,7 @@ class MailChatTests(unittest.TestCase):
         self.assertIn("哪一封", pick.answer)
         self.assertEqual(pick.sources, (a, b))
         outputs(model, {"action": "draft", "refs": ["1:2"]})
-        service.read_body.side_effect = RuntimeError("邮箱暂不可用")
+        service.read_content.side_effect = RuntimeError("邮箱暂不可用")
         result = chat.ask("回第二封", [QQ], [pick])
         self.assertIn("正文读取失败", result.answer)
         self.assertIsNone(result.draft_item)
@@ -137,14 +137,14 @@ class MailChatTests(unittest.TestCase):
         note = chat.ask("我周五四点有空，希望线上谈。", [QQ], [found])
         service.search_mail.assert_not_called()
         outputs(model, {"action": "draft", "refs": ["1:1"]})
-        service.read_body.return_value = "请问你什么时候有空？"
+        service.read_content.return_value = MailBody("请问你什么时候有空？")
         model.generate.return_value = "我周五四点有空，方便线上聊吗？"
         draft = chat.ask("照这个意思帮我回第二封", [QQ], [found, note])
         self.assertEqual(draft.draft_item, b)
         context = model.generate.call_args.kwargs["conversation"]
         self.assertEqual(context[-1]["用户"], note.question)
         self.assertEqual(context[0]["引用主题"], [a.subject, b.subject])
-        service.read_body.assert_called_once_with(QQ, b)
+        service.read_content.assert_called_once_with(QQ, b)
 
     def test_offline_topic_query_prefers_the_explicit_keyword(self):
         service = Mock()
@@ -152,6 +152,17 @@ class MailChatTests(unittest.TestCase):
         MailChat(service, DemoReplyAI()).ask("查找关于校样的邮件", [QQ])
         query = service.search_mail.call_args.args[1]
         self.assertEqual((query.text, query.sender), ("校样", ""))
+
+    def test_provider_scope_can_select_two_gmail_accounts_and_exclude_qq(self):
+        gmail = [Account("first@gmail.com", "gmail"), Account("second@googlemail.com", "gmail")]
+        service = Mock()
+        service.search_mail.return_value = MailSearchResult([], False)
+        chat = MailChat(service, DemoReplyAI())
+        chat.ask("只看 Gmail 收件箱里的未读邮件", [QQ, *gmail])
+        self.assertEqual([call.args[0] for call in service.search_mail.call_args_list], gmail)
+        service.reset_mock()
+        chat.ask("只看 Gmail 收件箱里的未读邮件", [QQ])
+        service.search_mail.assert_not_called()
 
     def test_truncated_empty_search_and_account_failure_are_visible(self):
         service, model = Mock(), Mock()
@@ -183,7 +194,7 @@ class MailChatTests(unittest.TestCase):
         item = mail(QQ, "组会通知")
         prior = ChatTurn("回第一封", "已起草", (item,), item, "我想在周末讨论。", (QQ.address,))
         chat = MailChat(service, model)
-        service.read_body.return_value = "方便约个时间讨论吗？"
+        service.read_content.return_value = MailBody("方便约个时间讨论吗？")
         model.generate.return_value = "周末方便讨论吗？"
         outputs(model, {"action": "revise", "refs": ["1:1"]})
         result = chat.ask("再短一点", [QQ], [prior])

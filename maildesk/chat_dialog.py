@@ -88,6 +88,7 @@ class _SourceButton(QPushButton):
 class ChatDialog(QDialog):
     open_mail = Signal(object)
     compose_reply = Signal(object, str)
+    draft_ready = Signal(object, str)
 
     def __init__(self, parent=None, *, accounts, model_description, ask, run, demo=False):
         super().__init__(parent)
@@ -338,6 +339,12 @@ class ChatDialog(QDialog):
             self._add_answer(turn)
             self._set_status("")
             self._update_controls()
+            if turn.draft_record is not None:
+                item = turn.draft_record.item
+                prior = next((t.draft_text for t in reversed(history) if t.draft_item and
+                              (t.draft_item.account, t.draft_item.validity, t.draft_item.uid)
+                              == (item.account, item.validity, item.uid)), "")
+                self.draft_ready.emit(turn.draft_record, prior)
 
         self._run(work, finished)
 

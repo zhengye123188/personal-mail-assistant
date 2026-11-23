@@ -1,10 +1,11 @@
-"""IMAP inbox access and SMTP replies for QQ and 163 Mail."""
+"""IMAP inbox access and SMTP replies for supported mail providers."""
 
 import base64
 import imaplib
 import re
 import smtplib
 import ssl
+from collections import OrderedDict
 from contextlib import closing, contextmanager, suppress
 from dataclasses import replace
 from datetime import timezone
@@ -14,6 +15,7 @@ from email.header import decode_header
 from email.parser import BytesHeaderParser, BytesParser
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from threading import Lock
 from urllib.parse import urljoin
 
 from .mail_replies import reply_envelope, reply_message
@@ -21,9 +23,9 @@ from .models import (
     PAGE_SIZE, Account, ArrivalBatch, InboxCursor, MailBody, MailItem, MailPage, MailQuery, MailSearchResult,
     ReplyEnvelope, normalize_cid,
 )
+from .providers import MAIL_PROVIDERS
 
 
-_HOSTS = {"qq": ("imap.qq.com", "smtp.qq.com"), "163": ("imap.163.com", "smtp.163.com")}
 _TIMEOUT = 12
 _BODY_LIMIT = 2 * 1024 * 1024
 _RICH_BODY_LIMIT = 8 * 1024 * 1024
@@ -31,12 +33,17 @@ _IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp
 _HEADER_FIELDS = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT)]<0.16384>)"
 _PREVIEW_OCTETS = 12288
 _DATE_BATCH = 256
+_DATE_CACHE_LIMIT = 16_384
 _SEARCH_DATE_CAP = 2048
 _SEARCH_PREVIEW_CAP = 80
 _UID = re.compile(rb"\bUID\s+(\d+)\b", re.I)
 _INTERNAL_DATE = re.compile(rb'\bINTERNALDATE\s+"([^"]+)"', re.I)
 _FLAGS = re.compile(rb"\bFLAGS\s*\(([^)]*)\)", re.I)
 _QUOTED_PREVIEW = re.compile(rb'\bPREVIEW\s+"((?:[^"\\]|\\.)*)"', re.I)
+_LOGIN_REJECTION = re.compile(
+    r"^(\[AUTHENTICATIONFAILED\]|(?:login|authentication) failed|invalid (?:credentials|username|password))",
+    re.IGNORECASE,
+)
 
 
 class MailClientError(RuntimeError):
@@ -52,6 +59,15 @@ def _ok(response):
     if kind != "OK":
         raise MailClientError("邮件服务器未完成此次请求，请刷新后重试。")
     return data
+
+
+def _has_capability(client, capability):
+    # imaplib decodes CAPABILITY tokens to str; adapters may expose raw IMAP bytes.
+    for value in client.capabilities:
+        name = value.decode("ascii") if isinstance(value, bytes) else value
+        if name.partition("=")[0].upper() == capability:
+            return True
+    return False
 
 
 def _decode(raw, charset=None, *, partial=False):
@@ -310,7 +326,7 @@ def _list_previews(client, uids, *, required=False):
     if not uids:
         return {}
     uid_set = ",".join(str(uid) for uid in uids)
-    if b"PREVIEW" in client.capabilities:
+    if _has_capability(client, "PREVIEW"):
         try:
             kind, data = client.uid("FETCH", uid_set, "(UID PREVIEW)")
             if kind == "OK":
@@ -497,14 +513,25 @@ def _with_previews(client, items, *, required=False):
     return [replace(item, preview=" ".join(previews.get(item.uid, "").split())[:200]) for item in items]
 
 
-def _ordered_inbox_uids(client):
-    # Capture identities once: expunges may renumber sequence positions between FETCHes.
-    data = _ok(client.uid("SEARCH", None, "ALL"))
-    uids = sorted({int(token) for line in data if line for token in line.split()})
-    return _uids_by_date(client, uids)
+def _server_inbox_order(client, count):
+    if not _has_capability(client, "SORT"):
+        return None
+    try:
+        # RFC 5256 breaks ties by ascending sequence number. Reversing the whole
+        # ascending result makes both INTERNALDATE and its UID tie-break descending.
+        status, data = client.uid("SORT", "(ARRIVAL)", "US-ASCII", "ALL")
+        if status == "OK":
+            uids = _uid_list(data)
+            if len(uids) == count and len(set(uids)) == count:
+                return tuple(reversed(uids))
+    except imaplib.IMAP4.abort:
+        raise
+    except (imaplib.IMAP4.error, MailClientError):
+        pass
+    return None
 
 
-def _uids_by_date(client, uids):
+def _fetch_dates(client, uids):
     dates = {}
     for offset in range(0, len(uids), _DATE_BATCH):
         batch = uids[offset:offset + _DATE_BATCH]
@@ -521,6 +548,10 @@ def _uids_by_date(client, uids):
                     raise MailClientError("邮件服务器返回了无效的收件日期，请刷新后重试。")
                 dates[int(uid[1])] = timestamp
         _check_missing_uids(client, {uid for uid in batch if uid not in dates})
+    return dates
+
+
+def _date_order(dates):
     return tuple(sorted(dates, key=lambda uid: (dates[uid], uid), reverse=True))
 
 
@@ -602,7 +633,7 @@ def _search_order(client, matches, take):
         return tuple(matches), ""
     notice = ""
     if len(matches) > _SEARCH_DATE_CAP:
-        if b"SORT" in client.capabilities:
+        if _has_capability(client, "SORT"):
             try:
                 kind, data = client.uid("SORT", "(REVERSE ARRIVAL)", "US-ASCII", "ALL")
                 if kind == "OK":
@@ -615,33 +646,82 @@ def _search_order(client, matches, take):
                 pass
         notice = f"候选邮件较多，仅按收件日期比较最近写入收件箱的 {_SEARCH_DATE_CAP} 封。"
     uids = sorted(matches)[-_SEARCH_DATE_CAP:]
-    return _uids_by_date(client, uids), notice
+    return _date_order(_fetch_dates(client, uids)), notice
 
 
 class MailClient:
     def __init__(self):
         self._tls = ssl.create_default_context()
+        self._icloud_login_names: dict[str, str] = {}
+        self._date_indexes = OrderedDict()
+        self._date_lock = Lock()
+
+    def _inbox_order(self, client, account, validity, count):
+        ordered = _server_inbox_order(client, count)
+        if ordered is not None:
+            return ordered
+
+        # UIDs and INTERNALDATE stay paired throughout one UIDVALIDITY generation.
+        # Refresh membership first: an old message imported today may have a large UID.
+        key = (account.address, validity)
+        live = sorted(set(_uid_list(_ok(client.uid("SEARCH", None, "ALL")))))
+        with self._date_lock:
+            previous = self._date_indexes.get(key, {})
+        dates = {uid: previous[uid] for uid in live if uid in previous}
+        dates.update(_fetch_dates(client, [uid for uid in live if uid not in previous]))
+        if len(dates) <= _DATE_CACHE_LIMIT:
+            snapshot = dates
+        else:
+            snapshot = {uid: dates[uid] for uid in live[-_DATE_CACHE_LIMIT:] if uid in dates}
+        # Publish a completed snapshot. A failed or concurrent fetch cannot mutate
+        # an existing reader's index. Evicted dates are simply fetched again.
+        if snapshot:
+            with self._date_lock:
+                self._date_indexes[key] = snapshot
+                self._date_indexes.move_to_end(key)
+                while sum(map(len, self._date_indexes.values())) > _DATE_CACHE_LIMIT:
+                    self._date_indexes.popitem(last=False)
+        return _date_order(dates)
 
     @staticmethod
-    def _servers(account):
+    def _provider(account):
         try:
-            return _HOSTS[account.provider]
+            return MAIL_PROVIDERS[account.provider]
         except KeyError:
-            raise MailClientError("请选择 QQ 邮箱或 163 邮箱。") from None
+            raise MailClientError("请选择支持的邮箱服务商。") from None
+
+    def _imap_login(self, client, account, secret):
+        names = (account.address,)
+        if account.provider == "icloud":
+            local = account.address.partition("@")[0]
+            preferred = self._icloud_login_names.get(account.address, local)
+            names = (preferred, account.address if preferred == local else local)
+        for username in names:
+            try:
+                _ok(client.login(username, secret))
+            except imaplib.IMAP4.abort:
+                raise
+            except imaplib.IMAP4.error as error:
+                reason = error.args[0] if error.args else ""
+                if isinstance(reason, bytes):
+                    reason = reason.decode("ascii", errors="replace")
+                if username == names[-1] or not _LOGIN_REJECTION.match(str(reason)):
+                    label = self._provider(account).credential_label
+                    raise MailClientError(f"IMAP 登录失败，请核对邮箱地址和{label}，并确认已开启 IMAP 服务。") from None
+            else:
+                if username != names[0]:
+                    # Avoid a rejected login on every subsequent iCloud inbox poll.
+                    self._icloud_login_names[account.address] = username
+                return
 
     @contextmanager
     def _inbox(self, account, secret, *, readonly=True):
-        host, _ = self._servers(account)
+        provider = self._provider(account)
         client = None
         try:
-            client = imaplib.IMAP4_SSL(host, 993, ssl_context=self._tls, timeout=_TIMEOUT)
-            try:
-                _ok(client.login(account.address, secret))
-            except imaplib.IMAP4.abort:
-                raise
-            except imaplib.IMAP4.error:
-                raise MailClientError("IMAP 登录失败，请核对邮箱地址和客户端授权码，并确认已开启 IMAP 服务。") from None
-            if account.provider == "163":
+            client = imaplib.IMAP4_SSL(provider.imap_host, 993, ssl_context=self._tls, timeout=_TIMEOUT)
+            self._imap_login(client, account, secret)
+            if provider.netease_id:
                 _ok(client.xatom("ID", '("name" "MailDesk" "version" "1.0")'))
             selected = _ok(client.select("INBOX", readonly=readonly))
             count = int(selected[0])
@@ -659,15 +739,35 @@ class MailClient:
                 with suppress(OSError, imaplib.IMAP4.error, EOFError):
                     client.logout()
 
+    @contextmanager
+    def _smtp_session(self, account, secret):
+        provider = self._provider(account)
+        use_starttls = provider.smtp_port == 587
+        if use_starttls:
+            connection = smtplib.SMTP(provider.smtp_host, provider.smtp_port, timeout=_TIMEOUT)
+        else:
+            connection = smtplib.SMTP_SSL(provider.smtp_host, provider.smtp_port, context=self._tls, timeout=_TIMEOUT)
+        with closing(connection) as client:
+            if use_starttls:
+                try:
+                    client.starttls(context=self._tls)
+                except (OSError, smtplib.SMTPException):
+                    raise MailClientError(f"无法与{provider.name}建立 SMTP 加密连接，请检查网络后重试。") from None
+            try:
+                client.login(account.address, secret)
+            except smtplib.SMTPAuthenticationError:
+                raise MailClientError(f"SMTP 登录失败，请检查发信服务及{provider.credential_label}。") from None
+            yield client
+            # A failed QUIT cannot invalidate a message the server already accepted.
+            with suppress(OSError, smtplib.SMTPException):
+                client.quit()
+
     def verify(self, account: Account, secret: str) -> None:
         with self._inbox(account, secret):
             pass
-        _, host = self._servers(account)
         try:
-            with smtplib.SMTP_SSL(host, 465, context=self._tls, timeout=_TIMEOUT) as client:
-                client.login(account.address, secret)
-        except smtplib.SMTPAuthenticationError:
-            raise MailClientError("SMTP 登录失败，请检查发信服务及客户端授权码。") from None
+            with self._smtp_session(account, secret):
+                pass
         except (OSError, smtplib.SMTPException, ValueError, UnicodeError):
             raise MailClientError("无法验证 SMTP 服务，请检查网络及发信服务设置。") from None
 
@@ -680,7 +780,7 @@ class MailClient:
                     raise MailClientError("收件箱标识已变化，请刷新邮件列表。")
                 return _page_from_cursor(client, account, before_uid)
             if before_uid is None and count > PAGE_SIZE:
-                cursor = InboxCursor(account.address, validity, _ordered_inbox_uids(client), 0)
+                cursor = InboxCursor(account.address, validity, self._inbox_order(client, account, validity, count), 0)
                 return _page_from_cursor(client, account, cursor)
             # Small inboxes fit in one request. Integer anchors retain their
             # original meaning for callers explicitly paging by UID.
@@ -797,21 +897,14 @@ class MailClient:
         return self._read_message(account, secret, item, rich=True)
 
     def send_reply(self, account: Account, secret: str, envelope: ReplyEnvelope, text: str) -> None:
-        _, host = self._servers(account)
         message = reply_message(account, envelope, text)
         submitting = False
         try:
-            with closing(smtplib.SMTP_SSL(host, 465, context=self._tls, timeout=_TIMEOUT)) as client:
-                client.login(account.address, secret)
+            with self._smtp_session(account, secret) as client:
                 submitting = True
                 refused = client.send_message(message, from_addr=account.address, to_addrs=[envelope.recipient])
                 if refused:
                     raise MailClientError("邮箱服务器拒绝了回复地址。")
-                # Acceptance is final even when the subsequent QUIT fails.
-                with suppress(OSError, smtplib.SMTPException):
-                    client.quit()
-        except smtplib.SMTPAuthenticationError:
-            raise MailClientError("SMTP 登录失败，请检查发信服务及客户端授权码。") from None
         except smtplib.SMTPRecipientsRefused:
             raise MailClientError("邮箱服务器拒绝了回复地址。") from None
         except (smtplib.SMTPResponseException, smtplib.SMTPNotSupportedError, UnicodeError):

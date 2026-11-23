@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from maildesk.models import Account, MailItem, MailPage
+from maildesk.providers import provider_for_address
 from maildesk.service import MailService
 
 
@@ -55,12 +56,55 @@ class AccountServiceTests(unittest.TestCase):
             ("other", "me@other.com", "ok"),
             ("qq", "a@b@qq.com", "ok"),
             ("qq", "me@qq.com", "  "),
+            ("gmail", "me@gmail.com.example.org", "abcdefghijklmnop"),
+            ("gmail", "me@school.example", "abcdefghijklmnop"),
+            ("gmail", "me@gmail.com", "too-short"),
+            ("icloud", "me@apple.com", "app-password"),
+            ("126", "me@vip.126.com", "ok"),
+            ("yahoo", "me@yahoo.co.jp", "ok"),
         ]
         for provider, address, secret in invalid:
             with self.subTest(address=address, provider=provider), self.assertRaises(ValueError):
                 self.service.bind(provider, address, secret)
         self.client.verify.assert_not_called()
         self.assertEqual(self.service.accounts(), [])
+
+    def test_personal_mail_domains_including_legacy_aliases(self):
+        addresses = {
+            "qq": ("qq.com",), "163": ("163.com",), "126": ("126.com",), "yeah": ("yeah.net",),
+            "gmail": ("gmail.com", "googlemail.com"), "icloud": ("icloud.com", "me.com", "mac.com"),
+            "yahoo": ("yahoo.com",),
+        }
+        for provider, domains in addresses.items():
+            for domain in domains:
+                with self.subTest(domain=domain):
+                    address = f" USER@{domain.upper()} "
+                    self.assertEqual(provider_for_address(address), provider)
+                    secret = "abcd efgh ijkl mnop" if provider == "gmail" else "Ab12-cd34 ef56"
+                    account = self.service.bind(provider, address, secret)
+                    expected = "abcdefghijklmnop" if provider == "gmail" else secret
+                    self.client.verify.assert_called_with(account, expected)
+                    self.assertEqual(self.vault.get(account.address), expected)
+        for invalid in ("", "user@", "@gmail.com", "x@y@gmail.com", "user@qq.com.example.org"):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(provider_for_address(invalid))
+
+    def test_existing_accounts_and_credentials_work_alongside_new_bindings(self):
+        old_path = self.db_path.with_name("existing.sqlite")
+        existing = [Account("me@qq.com", "qq"), Account("me@163.com", "163")]
+        with closing(sqlite3.connect(old_path)) as db:
+            db.execute("CREATE TABLE accounts (address TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL)")
+            for account in existing:
+                db.execute("INSERT INTO accounts VALUES (?, ?)", (account.address, account.provider))
+                self.vault.set(account.address, f"token-{account.provider}")
+            db.commit()
+        reopened = MailService(old_path, self.client, self.vault)
+        gmail = reopened.bind("gmail", "me@gmail.com", "abcd\u00a0efgh\u202fijkl mnop")
+        self.assertEqual(reopened.accounts(), [*existing, gmail])
+        for account in existing:
+            reopened.list_messages(account, 5)
+            self.client.list_messages.assert_called_with(account, f"token-{account.provider}", 5)
+        self.assertEqual(self.vault.get(gmail.address), "abcdefghijklmnop")
 
     def test_rebind_verification_failure_preserves_old_credentials(self):
         account = self.service.bind("163", "me@163.com", "old")

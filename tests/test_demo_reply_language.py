@@ -30,7 +30,7 @@ class DemoReplyLanguageTests(unittest.TestCase):
 
     def test_tab_suggestion_on_english_incoming_invitation_is_actionable(self):
         title = "Design review"
-        for body, phrase in (("Would Friday morning work for you?", "context?"),
+        for body, phrase in (("Would Friday morning work for you?", "my availability for Friday morning"),
                              ("The agenda is attached.", "Thank you for sharing")):
             with self.subTest(body=body):
                 suggestion = reply_suggestions(title, body)[0]

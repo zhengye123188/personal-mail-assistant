@@ -21,7 +21,7 @@ class MailClientTests(unittest.TestCase):
         self.factory = imap_patch.start()
         self.addCleanup(imap_patch.stop)
         self.imap = self.factory.return_value
-        self.imap.capabilities = (b"IMAP4REV1",)
+        self.imap.capabilities = ("IMAP4REV1",)
         self.imap.uid.return_value = ("OK", [])
         self.imap.login.return_value = ("OK", [b"authenticated"])
         self.imap.xatom.return_value = ("OK", [b"identified"])
@@ -29,21 +29,73 @@ class MailClientTests(unittest.TestCase):
         self.imap.response.return_value = ("UIDVALIDITY", [b"77"])
 
     @patch("maildesk.mail_client.smtplib.SMTP_SSL")
-    def test_verify_163_identifies_client_before_readonly_select_and_only_authenticates_smtp(self, smtp):
-        self.client.verify(ACCOUNT, "dummy")
-        self.imap.assert_has_calls([
-            call.login(ACCOUNT.address, "dummy"),
-            call.xatom("ID", '("name" "MailDesk" "version" "1.0")'),
-            call.select("INBOX", readonly=True),
+    def test_verify_implicit_tls_providers_authenticates_and_selects_inbox(self, smtp):
+        cases = [
+            ("qq", "qq.com", "qq.com"), ("163", "163.com", "163.com"),
+            ("126", "126.com", "126.com"), ("yeah", "yeah.net", "yeah.net"),
+            ("gmail", "gmail.com", "gmail.com"), ("yahoo", "yahoo.com", "mail.yahoo.com"),
+        ]
+        for provider, domain, host_domain in cases:
+            with self.subTest(provider=provider):
+                account = Account(f"student@{domain}", provider)
+                self.client.verify(account, "dummy")
+                calls = [call.login(account.address, "dummy")]
+                if provider in {"163", "126", "yeah"}:
+                    calls.append(call.xatom("ID", '("name" "MailDesk" "version" "1.0")'))
+                calls.append(call.select("INBOX", readonly=True))
+                self.imap.assert_has_calls(calls)
+                self.assertEqual(self.factory.call_args.args, (f"imap.{host_domain}", 993))
+                self.assertEqual(smtp.call_args.args, (f"smtp.{host_domain}", 465))
+                for args, name in ((self.factory.call_args, "ssl_context"), (smtp.call_args, "context")):
+                    self.assertTrue(args.kwargs[name].check_hostname)
+                    self.assertEqual(args.kwargs[name].verify_mode, ssl.CERT_REQUIRED)
+                    self.assertGreater(args.kwargs["timeout"], 0)
+                self.assertEqual(smtp.return_value.method_calls, [
+                    call.login(account.address, "dummy"), call.quit(), call.close(),
+                ])
+                self.imap.reset_mock()
+                smtp.reset_mock()
+
+    @patch("maildesk.mail_client.smtplib.SMTP")
+    def test_icloud_tries_full_imap_address_on_auth_rejection_and_upgrades_smtp(self, smtp):
+        account = Account("student@icloud.com", "icloud")
+        self.imap.login.side_effect = [imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] denied"), ("OK", [])]
+        self.client.verify(account, "dummy")
+        self.assertEqual(self.factory.call_args.args, ("imap.mail.me.com", 993))
+        self.assertEqual(self.imap.login.call_args_list, [call("student", "dummy"), call(account.address, "dummy")])
+        self.imap.xatom.assert_not_called()
+        self.assertEqual(smtp.call_args.args, ("smtp.mail.me.com", 587))
+        tls = self.factory.call_args.kwargs["ssl_context"]
+        self.assertTrue(tls.check_hostname)
+        self.assertEqual(tls.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(smtp.return_value.method_calls, [
+            call.starttls(context=tls), call.login(account.address, "dummy"), call.quit(), call.close(),
         ])
-        self.assertEqual(self.factory.call_args.args, ("imap.163.com", 993))
-        self.assertEqual(smtp.call_args.args, ("smtp.163.com", 465))
-        for args, name in ((self.factory.call_args, "ssl_context"), (smtp.call_args, "context")):
-            self.assertTrue(args.kwargs[name].check_hostname)
-            self.assertEqual(args.kwargs[name].verify_mode, ssl.CERT_REQUIRED)
-            self.assertGreater(args.kwargs["timeout"], 0)
-        sender = smtp.return_value.__enter__.return_value
-        self.assertEqual(sender.method_calls, [call.login(ACCOUNT.address, "dummy")])
+        self.imap.login.reset_mock(side_effect=True)
+        self.client.verify(account, "dummy")
+        self.imap.login.assert_called_once_with(account.address, "dummy")
+
+    @patch("maildesk.mail_client.smtplib.SMTP")
+    def test_icloud_does_not_retry_imap_on_service_errors(self, smtp):
+        account = Account("student@icloud.com", "icloud")
+        for error in (imaplib.IMAP4.abort("disconnected"), imaplib.IMAP4.error(b"[UNAVAILABLE] service down")):
+            with self.subTest(error=error):
+                self.imap.login.side_effect = error
+                with self.assertRaises(MailClientError):
+                    self.client.verify(account, "dummy")
+                self.imap.login.assert_called_once_with("student", "dummy")
+                self.imap.reset_mock()
+        smtp.assert_not_called()
+
+    @patch("maildesk.mail_client.smtplib.SMTP")
+    def test_icloud_smtp_never_sends_credentials_if_starttls_fails(self, smtp):
+        account = Account("student@icloud.com", "icloud")
+        smtp.return_value.starttls.side_effect = smtplib.SMTPNotSupportedError("STARTTLS unavailable")
+        with self.assertRaisesRegex(MailClientError, "SMTP"):
+            self.client.verify(account, "dummy")
+        self.imap.login.assert_called_once_with("student", "dummy")
+        smtp.return_value.login.assert_not_called()
+        smtp.return_value.close.assert_called_once_with()
 
     def _mock_dated_inbox(self, dates):
         """Keep separate logs for the lightweight date index and visible message content."""
@@ -113,6 +165,7 @@ class MailClientTests(unittest.TestCase):
         del dates[expected[39]]  # Previously displayed page boundary.
         del dates[expected[40]]  # Expunged before its page was fetched.
         dates[100] = "04-Jan-2026 10:00:00 +0800"
+        dates[101] = "01-Jan-2018 10:00:00 +0800"  # Imported history with a new UID.
         second = self.client.list_messages(account, "dummy", first.next_cursor)
         third = self.client.list_messages(account, "dummy", second.next_cursor)
         self.assertEqual(len(second.items), 40)
@@ -124,8 +177,80 @@ class MailClientTests(unittest.TestCase):
         self.assertTrue(all(c == call("INBOX", readonly=True) for c in self.imap.select.call_args_list))
         self.imap.xatom.assert_not_called()
 
+        metadata.clear()
         refreshed = self.client.list_messages(account, "dummy")
         self.assertEqual(refreshed.items[0].uid, 100)
+        self.assertEqual(refreshed.next_cursor.ordered_uids[-1], 101)
+        self.assertCountEqual(metadata, [100, 101])
+        metadata.clear()
+        self.client.list_messages(account, "dummy")
+        self.assertEqual(metadata, [])
+
+    def test_native_sort_handles_ties_across_pages_without_fetching_all_dates(self):
+        dates = dict.fromkeys(range(1, 91), "03-Jan-2026 10:00:00 +0800")
+        dates[89] = "03-Jan-2020 10:00:00 +0800"
+        headers, previews, metadata = self._mock_dated_inbox(dates)
+        self.imap.capabilities = ("IMAP4REV1", "SORT=DISPLAY", "PREVIEW")
+        command = self.imap.uid.side_effect
+
+        def sort_or_fetch(action, *args):
+            if action == "SORT":
+                self.assertEqual(args, ("(ARRIVAL)", "US-ASCII", "ALL"))
+                order = [89, *range(1, 89), 90]
+                return "OK", [" ".join(map(str, order)).encode()]
+            self.assertNotEqual(action, "SEARCH")
+            return command(action, *args)
+
+        self.imap.uid.side_effect = sort_or_fetch
+        first = self.client.list_messages(ACCOUNT, "dummy")
+        self.assertEqual(first.next_cursor.ordered_uids, (90, *range(88, 0, -1), 89))
+        self.assertCountEqual(headers, first.next_cursor.ordered_uids[:40])
+        self.assertCountEqual(previews, headers)
+        self.assertFalse(metadata)
+
+    def test_unavailable_or_partial_sort_falls_back_to_live_mailbox_dates(self):
+        dates = dict.fromkeys(range(1, 48), "03-Jan-2026 10:00:00 +0800")
+        _, _, metadata = self._mock_dated_inbox(dates)
+        self.imap.capabilities += (b"SORT",)
+        command = self.imap.uid.side_effect
+        for reply in (("NO", []), ("OK", [b"5"]), ("OK", [b"invalid"]), imaplib.IMAP4.error("BAD")):
+            with self.subTest(reply=reply):
+                def partial_sort(action, *args):
+                    if action == "SORT":
+                        if isinstance(reply, Exception):
+                            raise reply
+                        return reply
+                    return command(action, *args)
+
+                self.imap.uid.side_effect = partial_sort
+                result = self.client.list_messages(ACCOUNT, "dummy")
+                self.assertEqual(result.next_cursor.ordered_uids, tuple(range(47, 0, -1)))
+        self.assertCountEqual(metadata, dates)
+
+    def test_date_index_isolated_by_account_and_uidvalidity(self):
+        dates = dict.fromkeys(range(1, 55), "03-Jan-2026 10:00:00 +0800")
+        _, _, metadata = self._mock_dated_inbox(dates)
+        self.client.list_messages(ACCOUNT, "dummy")
+        dates[1] = "04-Jan-2026 10:00:00 +0800"
+        other = Account("other@163.com", "163")
+        for account in (other, ACCOUNT):
+            with self.subTest(account=account):
+                if account == ACCOUNT:
+                    self.imap.response.return_value = ("UIDVALIDITY", [b"99"])
+                metadata.clear()
+                self.assertEqual(self.client.list_messages(account, "dummy").items[0].uid, 1)
+                self.assertCountEqual(metadata, dates)
+
+    @patch("maildesk.mail_client._DATE_CACHE_LIMIT", 44)
+    def test_bounded_date_index_refetches_evicted_dates_without_losing_old_messages(self):
+        dates = dict.fromkeys(range(1, 51), "03-Jan-2020 10:00:00 +0800")
+        dates[1] = "04-Jan-2026 10:00:00 +0800"
+        _, _, metadata = self._mock_dated_inbox(dates)
+        self.client.list_messages(ACCOUNT, "dummy")
+        metadata.clear()
+        refreshed = self.client.list_messages(ACCOUNT, "dummy")
+        self.assertCountEqual(metadata, range(1, 7))
+        self.assertEqual(refreshed.items[0].uid, 1)
 
     def test_date_cursor_detects_replaced_mailbox_before_loading_reused_uids(self):
         dates = dict.fromkeys(range(1, 43), "03-Jan-2020 10:00:00 +0800")
@@ -460,7 +585,7 @@ class MailClientTests(unittest.TestCase):
     @patch("maildesk.mail_client.smtplib.SMTP_SSL")
     def test_server_failure_never_exposes_secret(self, smtp):
         secret = "secret-never-display"
-        sender = smtp.return_value.__enter__.return_value
+        sender = smtp.return_value
         sender.login.side_effect = smtplib.SMTPAuthenticationError(535, secret.encode())
         with self.assertRaisesRegex(MailClientError, "SMTP") as error:
             self.client.verify(ACCOUNT, secret)

@@ -3,10 +3,10 @@
 from dataclasses import replace
 from threading import Event
 
-from PySide6.QtCore import QEvent, QPointF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, Qt, Signal, QTimer
 from PySide6.QtGui import QPainter, QPalette, QTextCursor, QTextLayout
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 from shiboken6 import isValid
@@ -33,11 +33,15 @@ def _button(text, name):
 class _InstructionsEdit(QPlainTextEdit):
     submitted = Signal()
     completionChanged = Signal(str)
+    completionContextChanged = Signal()
 
     def __init__(self, suggestions):
         super().__init__()
         self._composing = False
         self._suggestions = tuple(s for s in suggestions if s and len(s) <= _INSTRUCTION_LIMIT)
+        self._model_candidate = ""
+        self._candidate_prefix = ""
+        self._last_prefix = None
         self.completion_suffix = ""
         self.textChanged.connect(self._refresh_completion)
         self.cursorPositionChanged.connect(self._refresh_completion)
@@ -48,9 +52,13 @@ class _InstructionsEdit(QPlainTextEdit):
         typed = self.toPlainText()
         cursor = self.textCursor()
         suffix = ""
+        eligible = None
         if (self.isEnabled() and not self.isReadOnly() and not self._composing
                 and cursor.atEnd() and not cursor.hasSelection()):
+            eligible = typed
             prefix, candidates = typed, self._suggestions
+            if self._model_candidate and typed.startswith(self._candidate_prefix) and self._model_candidate.startswith(typed):
+                candidates = (self._model_candidate, *candidates)
             if typed.startswith(("请帮我", "帮我")):
                 prefix = self._without_request_intro(typed)
                 candidates = tuple(self._without_request_intro(s) for s in candidates)
@@ -65,6 +73,21 @@ class _InstructionsEdit(QPlainTextEdit):
             self.setAccessibleDescription(f"建议补全：{suffix}。按 Tab 采用。" if suffix else "")
             self.completionChanged.emit(suffix)
             self.viewport().update()
+        if eligible != self._last_prefix:
+            self._last_prefix = eligible
+            self.completionContextChanged.emit()
+
+    def set_model_candidate(self, candidate, prefix=""):
+        self._model_candidate = candidate
+        self._candidate_prefix = prefix
+        self._refresh_completion()
+
+    def model_prefix(self):
+        prefix = self._last_prefix
+        if prefix is not None and len(prefix) <= 320 and not prefix.endswith(("。", "！", "？", "?", "!", "\n")):
+            if not prefix or prefix not in (*self._suggestions, self._model_candidate):
+                return prefix
+        return None
 
     @staticmethod
     def _without_request_intro(text):
@@ -142,9 +165,10 @@ class _InstructionsEdit(QPlainTextEdit):
 class ReplyDialog(QDialog):
     sent = Signal()
     configure_requested = Signal()
+    model_completion_toggled = Signal(bool)
 
     def __init__(self, parent=None, *, account, recipient, subject, model_description="",
-                 generate=None, converse=None, draft_with=None, suggestions=(), send, run, demo=False):
+                 generate=None, converse=None, draft_with=None, suggestions=(), complete=None, send, run, demo=False):
         super().__init__(parent)
         self._send = send if recipient else None
         self._run = run
@@ -158,6 +182,13 @@ class ReplyDialog(QDialog):
         self._converse = None
         self._draft_with = None
         self._generate = None
+        self._complete = None
+        self._completion_job = None
+        self._last_request = None
+        self._completion_timer = QTimer(self)
+        self._completion_timer.setSingleShot(True)
+        self._completion_timer.setInterval(700)
+        self._completion_timer.timeout.connect(self._fetch_completion)
         self.setObjectName("replyDialog")
         self.setMinimumSize(410, 425)
         self.setStyleSheet("""
@@ -226,6 +257,11 @@ class ReplyDialog(QDialog):
         self.completion_hint.setObjectName("completionHint")
         ai_header.addWidget(self.completion_hint)
         ai_header.addStretch()
+        self.model_completion = QCheckBox("模型补全")
+        self.model_completion.setToolTip("开启后，当前模型将根据来信主题、正文节选和你输入的开头给出 Tab 建议。")
+        self.model_completion.toggled.connect(self._completion_mode_changed)
+        self.model_completion.clicked.connect(lambda: self.model_completion_toggled.emit(self.model_completion.isChecked()))
+        ai_header.addWidget(self.model_completion)
         ai_header.addWidget(self.configure_button)
         ai_layout.addLayout(ai_header)
         self.instructions = _InstructionsEdit(suggestions)
@@ -233,6 +269,7 @@ class ReplyDialog(QDialog):
         self.instructions.setAccessibleName("告诉 AI 怎么回")
         self.completion_hint.setVisible(bool(self.instructions.completion_suffix))
         self.instructions.completionChanged.connect(lambda suffix: self.completion_hint.setVisible(bool(suffix)))
+        self.instructions.completionContextChanged.connect(self._schedule_completion)
         self.instructions.setTabChangesFocus(True)
         self.instructions.setFixedHeight(82)
         instructions_label.setBuddy(self.instructions)
@@ -294,7 +331,7 @@ class ReplyDialog(QDialog):
         self.send_button.clicked.connect(self._start_send)
         self.instructions.textChanged.connect(self._update_controls)
         self.draft.textChanged.connect(self._update_controls)
-        self.set_model(model_description, generate, converse, draft_with)
+        self.set_model(model_description, generate, converse, draft_with, complete=complete)
         if self.ai_tools.isHidden():
             self.resize(620, 550)
             self.draft.setFocus()
@@ -331,7 +368,10 @@ class ReplyDialog(QDialog):
         text = " ".join(text.split())
         return text[:limit].rstrip() + "…" if len(text) > limit else text
 
-    def set_model(self, description, generate, converse=None, draft_with=None):
+    def set_model(self, description, generate, converse=None, draft_with=None, *, complete=None):
+        self._clear_completion()
+        self._complete = complete
+        self.model_completion.setVisible(complete is not None)
         if self._pending_generation is not None:
             self._pending_generation.set()
             self._pending_generation = None
@@ -361,6 +401,71 @@ class ReplyDialog(QDialog):
         self.setWindowTitle(title)
         self.model_hint.setText(hint)
         self._update_controls()
+        self._schedule_completion()
+
+    def _clear_completion(self):
+        self._completion_timer.stop()
+        if self._completion_job is not None:
+            self._completion_job.set()
+            self._completion_job = None
+        self._last_request = None
+        self.instructions.set_model_candidate("")
+
+    def _completion_mode_changed(self):
+        self._clear_completion()
+        self._schedule_completion()
+
+    def _completion_prefix(self):
+        if (self._complete and self.model_completion.isChecked() and self._state == "idle"
+                and self.isActiveWindow() and self.isVisible()):
+            return self.instructions.model_prefix()
+        return None
+
+    def _schedule_completion(self):
+        self._completion_timer.stop()
+        prefix = self._completion_prefix()
+        if prefix is not None and prefix != self._last_request:
+            self._completion_timer.start()
+
+    def _fetch_completion(self):
+        prefix = self._completion_prefix()
+        if prefix is None or self._completion_job is not None or prefix == self._last_request:
+            return
+        complete = self._complete
+        cancelled = Event()
+        self._completion_job = cancelled
+        self._last_request = prefix
+
+        def work():
+            return "" if cancelled.is_set() else complete(prefix)
+
+        def finished(suffix, error):
+            if cancelled.is_set() or not isValid(self):
+                return
+            self._completion_job = None
+            if self._completion_prefix() == prefix:
+                if not error and isinstance(suffix, str) and suffix:
+                    self.instructions.set_model_candidate(prefix + suffix, prefix)
+            else:
+                self._schedule_completion()
+
+        self._run(work, finished)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_completion()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and hasattr(self, "instructions"):
+            if self.isActiveWindow():
+                self._schedule_completion()
+            elif self._completion_job is not None:
+                self._clear_completion()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._clear_completion()
 
     def _update_controls(self):
         editable = self._state not in ("sending", "sent")

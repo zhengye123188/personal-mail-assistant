@@ -4,11 +4,11 @@ import unittest
 from dataclasses import replace
 from email.message import EmailMessage
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, call, patch
 
 from maildesk.demo import DemoVault
 from maildesk.mail_client import MailClient, MailClientError, ReplyDeliveryUncertain, _parse_body
-from maildesk.models import ReplyEnvelope
+from maildesk.models import Account, ReplyEnvelope
 from maildesk.service import MailService
 from tests.mail_fixtures import ACCOUNTS, FixtureClient
 
@@ -61,7 +61,8 @@ class ReplyTests(unittest.TestCase):
         connection = smtp.return_value
         connection.send_message.return_value = {}
         connection.quit.side_effect = smtplib.SMTPServerDisconnected("closed after acceptance")
-        for account in ACCOUNTS:
+        accounts = (*ACCOUNTS, Account("reader@gmail.com", "gmail"))
+        for account in accounts:
             with self.subTest(account=account):
                 client.send_reply(account, "test-code", reply, "我编辑过的回复。")
                 self.assertEqual(smtp.call_args.args, (f"smtp.{account.provider}.com", 465))
@@ -79,7 +80,22 @@ class ReplyTests(unittest.TestCase):
                 self.assertIn("Date", sent)
                 self.assertIsNone(sent["Cc"])
                 self.assertEqual(sent.get_content().strip(), "我编辑过的回复。")
-        self.assertEqual(connection.send_message.call_count, 2)
+        self.assertEqual(connection.send_message.call_count, len(accounts))
+
+    @patch("maildesk.mail_client.smtplib.SMTP")
+    def test_icloud_reply_upgrades_before_authenticating_and_submits_once(self, smtp):
+        account = Account("reader@icloud.com", "icloud")
+        reply = ReplyEnvelope("review@example.org", "Re: Review")
+        connection = smtp.return_value
+        connection.send_message.return_value = {}
+        connection.quit.side_effect = smtplib.SMTPServerDisconnected("closed after acceptance")
+        MailClient().send_reply(account, "test-code", reply, "Hello")
+        self.assertEqual(smtp.call_args.args, ("smtp.mail.me.com", 587))
+        self.assertEqual(connection.method_calls, [
+            call.starttls(context=ANY), call.login(account.address, "test-code"),
+            call.send_message(ANY, from_addr=account.address, to_addrs=[reply.recipient]),
+            call.quit(), call.close(),
+        ])
 
     @patch("maildesk.mail_client.smtplib.SMTP_SSL")
     def test_refusal_and_lost_ack_are_distinct_and_do_not_retry(self, smtp):
