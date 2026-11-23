@@ -1,62 +1,31 @@
-"""Display mail text and validated images in a native Qt document."""
+"""Read text immediately and start the HTML engine on the first rich message."""
 
-from dataclasses import replace
-
-from PySide6.QtCore import QByteArray, QUrl
-from PySide6.QtGui import QDesktopServices, QTextCursor, QTextDocument, QTextFormat
-from PySide6.QtWidgets import QApplication, QFrame, QMenu, QTextBrowser
+from PySide6.QtCore import QByteArray, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QApplication, QFrame, QMenu, QStackedWidget, QTextBrowser
 
 from .mail_html import build_mail_html, plain_body_html, safe_link
-from .mail_images import data_image, decode_raster
-from .models import normalize_cid
 
 
-_MAX_IMAGE_BYTES = 48 * 1024 * 1024
-
-
-class _MailDocument(QTextDocument):
-    def loadResource(self, kind, url):
-        # Only addResource() may supply bytes. This also covers CSS imports and backgrounds.
-        return QByteArray()
-
-
-class MessageBodyView(QTextBrowser):
-    def __init__(self, parent=None):
+class _TextView(QTextBrowser):
+    def __init__(self, parent):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setOpenLinks(False)
         self.setOpenExternalLinks(False)
         self.setAcceptDrops(False)
+        self.document().setDocumentMargin(18)
         font = self.font()
         font.setPixelSize(15)
         self.setFont(font)
-        self._plain_text = ""
-        self._generation = 0
-        self._remote = {}
-        self._failed = set()
-        self._decoded_bytes = 0
         self.anchorClicked.connect(self._open_link)
-        self._reset_document()
 
-    def _reset_document(self):
-        self._generation += 1
-        self._remote.clear()
-        self._failed.clear()
-        self._decoded_bytes = 0
-        old = self.document()
-        owned_document = isinstance(old, _MailDocument)
-        doc = _MailDocument(self)
-        doc.setDefaultFont(self.font())
-        doc.setDocumentMargin(18)
-        self.setDocument(doc)
-        self.setUndoRedoEnabled(False)
-        if owned_document:
-            old.deleteLater()
+    def loadResource(self, kind, url):
+        return QByteArray()
 
-    def _open_link(self, url):
-        if url.isRelative() and url.toString().startswith("#"):
-            self.scrollToAnchor(url.fragment())
-        elif safe_link(url.toString()):
+    @staticmethod
+    def _open_link(url):
+        if safe_link(url.toString()):
             QDesktopServices.openUrl(url)
 
     def contextMenuEvent(self, event):
@@ -70,111 +39,82 @@ class MessageBodyView(QTextBrowser):
         if not menu.isEmpty():
             menu.exec(event.globalPos())
 
+
+class MessageBodyView(QStackedWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._plain = _TextView(self)
+        self._plain_text = ""
+        self.addWidget(self._plain)
+        self._web = None
+        self._web_available = True
+        self._release = QTimer(self)
+        self._release.setSingleShot(True)
+        self._release.timeout.connect(self._release_web)
+
+    def _show_text_view(self):
+        if self._web is None:
+            return
+        if self.currentWidget() is self._web:
+            self.setCurrentWidget(self._plain)
+            self._web.release_document()
+        # The next message can still be waiting for IMAP even after a brief
+        # stop on a plain-text mail. Give that lookup the normal reuse window.
+        self._release.start(5_000)
+
+    def _release_web(self):
+        if self._web is not None and self.currentWidget() is self._plain:
+            self.removeWidget(self._web)
+            self._web.deleteLater()
+            self._web = None
+
     def setPlainText(self, text):
-        self._reset_document()
+        self._show_text_view()
         self._plain_text = text
         if "://" in text:
-            self.setHtml(plain_body_html(text))
+            self._plain.setHtml(plain_body_html(text))
         else:
-            super().setPlainText(text)
-
-    def toPlainText(self):
-        return self._plain_text if self._plain_text is not None else super().toPlainText()
+            self._plain.setPlainText(text)
 
     def clear(self):
         self.setPlainText("")
 
-    def _store_image(self, name, raw):
-        if self._decoded_bytes >= _MAX_IMAGE_BYTES:
-            return False
-        image = decode_raster(raw)
-        if image is None or self._decoded_bytes + image.sizeInBytes() > _MAX_IMAGE_BYTES:
-            return False
-        self.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(name), image)
-        self._decoded_bytes += image.sizeInBytes()
-        return True
-
     def display_body(self, content):
         if not content.html:
             self.setPlainText(content.text)
+            # Keep rapid keyboard navigation through a text mail warm. Readers
+            # who stay here no longer need the old Chromium page or its profile.
+            if self._web is not None:
+                self._release.start(350)
             return
-        self._reset_document()
+        if self._web is None and self._web_available:
+            try:
+                from .web_reader import WebMailView
+            except (ImportError, OSError):
+                self._web_available = False
+            else:
+                self._web = WebMailView(self)
+                self.addWidget(self._web)
+        if self._web is None:
+            self._plain_text = None
+            self._plain.setHtml(build_mail_html(content))
+            return
+        self._release.stop()
         self._plain_text = None
-        if content.inline_images:
-            inline = {normalize_cid(key): raw for key, raw in content.inline_images.items()}
-            content = replace(content, inline_images=inline)
+        self._plain.clear()
+        self.setCurrentWidget(self._web)
+        self._web.display_body(content)
 
-        next_image = 0
-
-        def image_url(source):
-            nonlocal next_image
-            next_image += 1
-            name = f"maildesk://message/{self._generation}/{next_image}"
-            if source in content.inline_images:
-                return name if self._store_image(name, content.inline_images[source]) else None
-            if source.lower().startswith("data:"):
-                return name if self._store_image(name, data_image(source)) else None
-            if safe_link(source):
-                self._remote[source] = name
-                return name
-            return None
-
-        self.setHtml(build_mail_html(content, image_url))
+    def toPlainText(self):
+        if self._plain_text is not None:
+            return self._plain_text
+        return self.currentWidget().toPlainText()
 
     @property
     def remote_urls(self):
-        return tuple(self._remote)
+        return self._web.remote_urls if self.currentWidget() is self._web else ()
 
     def set_remote_images(self, images, *, attempted_urls=()):
-        failed = set()
-        restored = set()
-        count = 0
-        for source in set(attempted_urls).union(images):
-            name = self._remote.get(source)
-            if name is None:
-                continue
-            if self._store_image(name, images.get(source)):
-                del self._remote[source]
-                if name in self._failed:
-                    self._failed.remove(name)
-                    restored.add(name)
-                count += 1
-            elif name not in self._failed:
-                self._failed.add(name)
-                failed.add(name)
-        if failed or restored:
-            self._update_image_labels(failed, restored)
-        if count:
-            self.document().markContentsDirty(0, self.document().characterCount())
-        return count
-
-    def _update_image_labels(self, failed, restored):
-        # Keep the original image properties (and surrounding link) in the text
-        # format so a retry can swap just this label back into an image.
-        doc = self.document()
-        edits = []
-        block = doc.begin()
-        while block.isValid():
-            it = block.begin()
-            while not it.atEnd():
-                fragment = it.fragment()
-                fmt = fragment.charFormat()
-                name = fmt.stringProperty(QTextFormat.Property.ImageName)
-                if name in failed or name in restored:
-                    label = " ".join(fmt.stringProperty(QTextFormat.Property.ImageAltText).split())[:200] or "图片未能显示"
-                    if fmt.isImageFormat() and name in failed:
-                        fmt.setObjectType(QTextFormat.ObjectTypes.NoObject)
-                        edits.append((fragment.position(), fragment.length(), label * fragment.length(), fmt))
-                    elif not fmt.isImageFormat() and name in restored:
-                        fmt.setObjectType(QTextFormat.ObjectTypes.ImageObject)
-                        count = fragment.text().count(label)
-                        edits.append((fragment.position(), fragment.length(), "\ufffc" * count, fmt))
-                it += 1
-            block = block.next()
-        cursor = QTextCursor(doc)
-        cursor.beginEditBlock()
-        for start, length, text, fmt in reversed(edits):
-            cursor.setPosition(start)
-            cursor.setPosition(start + length, QTextCursor.MoveMode.KeepAnchor)
-            cursor.insertText(text, fmt)
-        cursor.endEditBlock()
+        if self.currentWidget() is self._web:
+            return self._web.set_remote_images(images, attempted_urls=attempted_urls)
+        return 0

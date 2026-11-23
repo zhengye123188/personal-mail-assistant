@@ -28,7 +28,7 @@ class MailHTMLTests(unittest.TestCase):
         self.assertIn('?tab=a&amp;b=c" rel="noreferrer">View pull request</a>', html)
         self.assertNotIn('target="_blank"', html)
 
-    def test_hidden_preheader_and_vector_content_leave_link_label_readable(self):
+    def test_hidden_preheader_and_static_octicon(self):
         markup = ('<style>.preheader { display:none !important }</style>'
                   '<span class="preheader">Notification ID 123</span>'
                   '<a href="https://github.com/example"><svg width="16" height="16" viewBox="0 0 16 16" '
@@ -37,9 +37,11 @@ class MailHTMLTests(unittest.TestCase):
                   '<image href="https://example.org/logo.svg"/><circle cx="5" cy="5" r="1"/>'
                   '</svg>Open conversation</a>')
         html = build_mail_html(MailBody("", markup), self.fail)
-        self.assertNotIn("Notification ID", html)
-        self.assertNotIn("<svg", html)
-        self.assertIn('href="https://github.com/example" rel="noreferrer">Open conversation</a>', html)
+        self.assertIn('.preheader { display:none !important }', html)
+        self.assertIn('<span class="preheader">Notification ID 123</span>', html)
+        self.assertIn('viewBox="0 0 16 16"', html)
+        self.assertIn('<title>GitHub</title><g fill="currentColor"><path d="M1 0L2 3Z">', html)
+        self.assertIn('<circle cx="5" cy="5" r="1"></circle></svg>Open conversation</a>', html)
         self.assertNotIn('untrusted frame', html)
         self.assertNotIn('logo.svg', html)
 
@@ -68,10 +70,9 @@ class MailHTMLTests(unittest.TestCase):
             "https://cdn.example.org/icon", "data:image/png;base64,abcd",
         ])
         self.assertIn('href="https://example.org/templates/view" rel="noreferrer"> <img alt="View" src=', html)
-        self.assertIn('width="120" src="maildesk:', html)
-        self.assertEqual(html.count('src="maildesk:'), 6)
-        self.assertIn('Missing', html)
-        self.assertNotIn('file:', html)
+        self.assertIn('height="60" width="120" src="maildesk:', html)
+        self.assertEqual(html.partition("<body>")[2].count('data-maildesk-image="pending"'), 3)
+        self.assertIn('<img alt="Missing">', html)
         self.assertNotIn("<base", html)
 
     def test_drop_active_content_and_gate_all_resource_requests(self):
@@ -91,8 +92,9 @@ class MailHTMLTests(unittest.TestCase):
             self.assertNotIn(absent, html)
         self.assertIn("<p>Body</p>", html)
         self.assertIn('<button type="button">Send</button>', html)
-        self.assertIn('Unavailable', html)
-        self.assertNotIn('<img', html)
+        self.assertIn('<img alt="Unavailable">', html)
+        self.assertIn("default-src 'none'; img-src maildesk:; style-src 'unsafe-inline'", html)
+        self.assertEqual(html.count("Content-Security-Policy"), 1)
 
     def test_safe_link_and_plain_text_fallback(self):
         for url in ("data:text/plain,hi", "file:///Users/reader", "https://user:secret@example.org/",

@@ -6,7 +6,7 @@ from dataclasses import replace
 from email.message import EmailMessage
 from unittest.mock import call, patch
 
-from maildesk.mail_client import MailClient, MailClientError
+from maildesk.mail_client import MailClient, MailClientError, _parse_body
 from maildesk.models import Account, MailItem
 
 
@@ -450,6 +450,20 @@ class MailClientTests(unittest.TestCase):
         self.imap.uid.return_value = ("OK", [(b"3 (BODY[]<0> {100}", raw), b" UID 42)"])
         self.assertEqual(self.client.read_body(ACCOUNT, "dummy", ITEM), "你的面试在周一。")
         self.imap.uid.assert_called_with("FETCH", "42", "(UID RFC822.SIZE BODY.PEEK[]<0.2097152>)")
+
+    def test_segmented_body_preserves_utf8_and_multipart_boundary(self):
+        header = (b"From: sender@example.org\r\nReply-To: team@example.org\r\nSubject: Schedule\r\n"
+                  b"Content-Type: multipart/alternative; boundary=m\r\n\r\n"
+                  b"--m\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n")
+        padding = b"a" * (64 * 1024 - len(header) - 1)
+        # One character spans parser chunks; the CRLF before the next MIME part spans IMAP literals.
+        first = header + padding + "周五".encode() + b"\r"
+        second = b"\n--m\r\nContent-Type: text/html; charset=utf-8\r\n\r\n" + "<b>周五</b>".encode() + b"\r\n--m--\r\n"
+        body = _parse_body(first, second, rich=True)
+        self.assertEqual(body.text, padding.decode() + "周五")
+        self.assertEqual(body.html, "<b>周五</b>")
+        self.assertEqual(body.reply.recipient, "team@example.org")
+        self.assertEqual(body.reply.subject, "Re: Schedule")
 
     def test_rich_body_preserves_html_alternative_and_only_its_referenced_inline_images(self):
         msg = EmailMessage()

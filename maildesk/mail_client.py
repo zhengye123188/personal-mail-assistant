@@ -12,7 +12,7 @@ from datetime import timezone
 from email import policy
 from email.errors import CloseBoundaryNotFoundDefect, MessageError
 from email.header import decode_header
-from email.parser import BytesHeaderParser, BytesParser
+from email.parser import BytesFeedParser, BytesHeaderParser
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from threading import Lock
@@ -229,8 +229,18 @@ def _image_body(msg, incomplete):
     return MailBody("（图片邮件）" if images else "", html, images)
 
 
-def _parse_body(raw, *, rich=False, partial=False):
-    msg = BytesParser(policy=policy.default).parsebytes(raw)
+def _parse_mime(*segments):
+    # Feed the original IMAP literals in bounded chunks. In particular, keep
+    # MIME section headers and body continuations separate until they are parsed.
+    parser = BytesFeedParser(policy=policy.default)
+    for segment in segments:
+        for start in range(0, len(segment), 64 * 1024):
+            parser.feed(segment[start:start + 64 * 1024])
+    return parser.close()
+
+
+def _parse_body(raw, *continuations, rich=False, partial=False):
+    msg = _parse_mime(raw, *continuations)
     body = _mime_body(msg, rich, partial)
     if rich and (not partial or re.search(rb"\r?\n\r?\n", raw)):
         return replace(body, reply=reply_envelope(msg))
@@ -415,7 +425,7 @@ def _find_late_body(client, uid, initial, rich, root_base):
             continue
         raw = _fetch_part(client, uid, section, _BODY_LIMIT)
         if raw:
-            candidate = _parse_body(headers + raw, rich=rich, partial=len(raw) >= _BODY_LIMIT)
+            candidate = _parse_body(headers, raw, rich=rich, partial=len(raw) >= _BODY_LIMIT)
             if not rich and candidate.text:
                 if len(raw) >= _BODY_LIMIT:
                     candidate = replace(candidate, text=candidate.text + "\n\n（正文较长，仅显示前 2 MiB 内的内容。）")
@@ -439,7 +449,7 @@ def _find_late_body(client, uid, initial, rich, root_base):
         remaining -= len(raw)
         if remaining < 0:
             break
-        image = BytesParser(policy=policy.default).parsebytes(headers + raw)
+        image = _parse_mime(headers, raw)
         payload = image.get_payload(decode=True)
         if payload and not image.defects:
             resources.update((key, payload) for key in aliases)
@@ -936,7 +946,7 @@ class MailClient:
                                 limit = (total if total is not None else _RICH_BODY_LIMIT + 1) - len(raw)
                                 tail = _fetch_part(client, item.uid, "", limit, offset=len(raw))
                                 if tail and (len(tail) == limit if total is not None else len(tail) < limit):
-                                    return _parse_body(raw + tail, rich=True)
+                                    return _parse_body(raw, tail, rich=True)
                             return MailBody("这封图片邮件超过预览限制，或尚未完整载入。", reply=body.reply)
                         missing = {src for src in _parse_html(body.html).images
                                    if src not in body.inline_images and not src.lower().startswith("data:")}
