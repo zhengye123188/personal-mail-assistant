@@ -98,3 +98,9 @@ The **对话** (Chat) sidebar shows conversations for the selected inbox or grou
 To delete a conversation, click the trash icon next to its title and confirm. Confirmed tasks and saved email drafts remain available in their respective folders. For conversations longer than eight rounds, click **更早记录** (Earlier messages) to read the previous exchanges.
 
 Conversations and references to source emails are stored locally in SQLite. When you upgrade, earlier saved conversation excerpts are grouped by the inboxes they belonged to. Each new request can use excerpts from up to the last four exchanges in the active conversation. The assistant can search mail, read messages, list tasks, suggest reminders, and draft replies as needed. The background reminder check reads the local task list.
+
+## License
+
+The project's original code and documentation are licensed under the MIT License. You may modify, use commercially, and redistribute them. Include the copyright and permission notices when copying or distributing all or a substantial portion of the software. [Full MIT License](./LICENSE)
+
+Third-party components in the desktop installers retain their upstream licenses. The mail reader uses Qt WebEngine and Chromium. The v0.2.0 Apple silicon build also includes Qt Charts. [Qt WebEngine and Chromium licensing](https://doc.qt.io/qt-6/qtwebengine-licensing.html) · [Qt Charts licensing](https://doc.qt.io/qt-6/qtcharts-index.html#licenses)
