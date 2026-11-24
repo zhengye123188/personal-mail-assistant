@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QPushBu
 from maildesk.models import Account, InboxCursor, MailBody, MailPage, PAGE_SIZE
 from maildesk.providers import MAIL_PROVIDERS
 from maildesk.reply_ai import ReplyAI
-from maildesk.service import MailService
+from maildesk.service import CredentialAccessPaused, MailboxAuthorizationRequired, MailService
 from maildesk.ui import MainWindow
 from tests.mail_fixtures import MemoryVault, ACCOUNTS, FixtureClient, PNG
 
@@ -393,6 +393,52 @@ class DesktopFlowTests(DesktopTestCase):
             self.assertEqual(first.draft.toPlainText(), "")
             first.instructions.clear()
             first.close()
+
+    def test_journal_notification_tab_completes_in_reply_and_restored_draft(self):
+        account = ACCOUNTS[1]
+        subject = "Journal of Cloud Computing submission update"
+        body = ("Please upload the COI-17 disclosure form in the submission portal.\n"
+                "Please do not reply to this email.")
+        self.client._examples["163"] = ((3, 1, "Editorial Office", subject, body),
+                                        *self.client._examples["163"][1:])
+        self.client._senders["Editorial Office"] = "do-not-reply"
+        self.bind_in_ui(account)
+        self.set_ai_enabled(True)
+        key, dialog = self.open_first_reply(account)
+
+        def accept_suggestion(composer):
+            self.assertTrue(composer.completion_hint.isVisible())
+            self.assertTrue(composer.model_completion.isVisible())
+            self.assertFalse(composer.model_completion.isChecked())
+            field = composer.instructions
+            self.assertEqual(field.toPlainText(), "")
+            hint = field.placeholderText()
+            self.assertIn("COI-17", hint)
+            field.setFocus()
+            QTest.keyClick(field, Qt.Key.Key_Tab)
+            self.assertEqual(field.toPlainText(), hint)
+            self.assertTrue(composer.generate_button.isEnabled())
+            self.provider.assert_not_called()
+            self.assertFalse(self.client.sent_replies)
+
+        accept_suggestion(dialog)
+        self.assertEqual(dialog.draft.toPlainText(), "")
+        dialog.instructions.clear()
+        dialog.draft.setPlainText("Handwritten draft")
+        self.assertTrue(self.window.close())
+        self.window.deleteLater()
+        self.window = MainWindow(self.service)
+        self.window.show()
+        self.wait_until(lambda: not self.window.jobs)
+        self.show_mailbox("drafts")
+        self.click_message(0)
+        self.window.reply_button.click()
+        restored = self.window.reply_drafts[key].dialog
+        accept_suggestion(restored)
+        self.assertEqual(restored.draft.toPlainText(), "Handwritten draft")
+        restored.model_completion.click()
+        self.assertTrue(restored.model_completion.isChecked())
+        self.provider.assert_not_called()
 
     def test_mail_chat_followup_opens_reply_with_original_context_and_revises_manual_edits(self):
         qq, netease = ACCOUNTS
@@ -966,6 +1012,135 @@ class DesktopFlowTests(DesktopTestCase):
 
 
 class ProviderDesktopTests(DesktopTestCase):
+    def test_startup_shows_cached_mail_and_consent_names_only_one_mailbox(self):
+        qq, netease = ACCOUNTS
+        for account in ACCOUNTS:
+            self.service.bind(account.provider, account.address, "fixture")
+            self.service.list_messages(account)
+        trusted = set()
+        prompts = []
+        release = threading.Event()
+
+        def passive(address):
+            if address not in trusted:
+                raise MailboxAuthorizationRequired()
+            return "fixture"
+
+        def authorize(account):
+            prompts.append(account.address)
+            if len(prompts) == 1:
+                self.assertTrue(release.wait(4))
+                raise CredentialAccessPaused()
+            trusted.add(account.address)
+
+        with patch.object(self.service._vault, "get_for_mail", side_effect=passive, create=True), \
+                patch.object(self.service, "authorize_mailbox", side_effect=authorize):
+            self.window._load_accounts()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(self.window.mail_list.count(), 6)
+            self.assertEqual(self.window.retry_button.text(), "授权并记住")
+            self.assertIn(qq.address, self.window.notice_label.text())
+            self.assertIn("系统钥匙串", self.window.notice_label.text())
+            self.show_mailbox("account", netease.address)
+            self.window.refresh_button.click()
+            self.window.reminder_timer.timeout.emit()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(prompts, [])
+            self.assertIn(netease.address, self.window.retry_button.toolTip())
+            self.window.retry_button.click()
+            try:
+                self.wait_until(lambda: bool(prompts))
+                self.assertFalse(self.window.retry_button.isEnabled())
+                self.show_mailbox("all")
+                self.assertFalse(self.window.retry_button.isEnabled())
+            finally:
+                release.set()
+            self.wait_until(lambda: not self.window.jobs)
+            self.window.reminder_timer.timeout.emit()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(prompts, [netease.address])
+            self.show_mailbox("account", netease.address)
+            self.window.retry_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertFalse(self.window.notice.isVisible())
+            self.show_mailbox("all")
+            self.assertIn(qq.address, self.window.notice_label.text())
+            self.show_mailbox("pending")
+            self.assertIn(qq.address, self.window.retry_button.toolTip())
+            self.assertEqual(prompts, [netease.address, netease.address])
+
+    def test_dismiss_binding_while_waiting_for_the_credential_store(self):
+        account = ACCOUNTS[0]
+        started, release = threading.Event(), threading.Event()
+        store = self.service._vault.set
+
+        def delayed_store(address, secret):
+            started.set()
+            self.assertTrue(release.wait(4))
+            return store(address, secret)
+
+        with patch.object(self.service._vault, "set", side_effect=delayed_store):
+            self.window.findChild(QPushButton, "bindButton").click()
+            dialog = self.window.binding
+            dialog.address.setText(account.address)
+            dialog.secret.setText("fixture-key")
+            dialog.submit.click()
+            try:
+                self.wait_until(started.is_set)
+                self.assertTrue(dialog.close())
+                self.assertFalse(dialog.isVisible())
+                self.assertFalse(dialog.secret.text())
+                self.assertIsNone(self.app.activeModalWidget())
+            finally:
+                release.set()
+            self.wait_until(lambda: self.window.binding is None and not self.window.jobs)
+            self.assertEqual(self.service.accounts(), [account])
+            self.assertEqual(self.window.mail_list.count(), 3)
+
+    def test_close_window_during_model_key_save_preserves_selection(self):
+        started, release = threading.Event(), threading.Event()
+
+        def delayed_store(address, secret):
+            started.set()
+            self.assertTrue(release.wait(4))
+
+        with patch("maildesk.reply_settings.KeyringVault") as vault:
+            vault.return_value.set.side_effect = delayed_store
+            self.window.ai_settings_button.click()
+            dialog = self.window.model_settings
+            dialog.enabled.setChecked(True)
+            dialog.key.setText("fixture-key")
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Save).click()
+            try:
+                self.wait_until(started.is_set)
+                dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+                self.assertFalse(dialog.isVisible())
+                self.assertTrue(self.window.close())
+                self.assertIsNone(self.app.activeModalWidget())
+            finally:
+                release.set()
+            self.wait_until(lambda: not self.window.jobs)
+        settings = QSettings(self.window.reply_prefs.fileName(), QSettings.Format.IniFormat)
+        self.assertEqual(settings.value("selection")["provider"], "deepseek")
+        self.assertTrue(settings.value("keys/deepseek", False, type=bool))
+
+    def test_only_explicit_retry_or_refresh_resumes_credential_prompts(self):
+        account = ACCOUNTS[0]
+        self.bind_in_ui(account)
+        self.wait_until(lambda: not self.window.jobs)
+        self.client.unavailable.add(account.address)
+        with patch("maildesk.ui.KeyringVault.resume_access") as resume:
+            self.window.reminder_timer.timeout.emit()
+            self.show_mailbox("account", account.address)
+            self.wait_until(lambda: not self.window.jobs)
+            resume.assert_not_called()
+            self.window.refresh_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(resume.call_count, 1)
+            self.window.retry_button.click()
+            self.wait_until(lambda: not self.window.jobs)
+            self.assertEqual(resume.call_count, 2)
+
     def test_suffix_selection_preserves_local_name_and_shows_provider_instructions(self):
         self.window.findChild(QPushButton, "bindButton").click()
         dialog = self.window.binding

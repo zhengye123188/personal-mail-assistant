@@ -227,6 +227,7 @@ class ReplyDialog(QDialog):
         scroll.setWidget(page)
         outer.addWidget(scroll, 1)
         headers = QFormLayout()
+        headers.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         headers.setVerticalSpacing(4)
         headers.setHorizontalSpacing(13)
         for name, value in (("发件人", account), ("收件人", recipient or "未找到可回复地址"), ("主题", subject)):
@@ -251,7 +252,7 @@ class ReplyDialog(QDialog):
         self.configure_button.clicked.connect(self.configure_requested)
         ai_header = QHBoxLayout()
         ai_header.addWidget(instructions_label)
-        self.completion_hint = _label("Tab 补全")
+        self.completion_hint = _label("按 Tab 采纳")
         self.completion_hint.setObjectName("completionHint")
         ai_header.addWidget(self.completion_hint)
         ai_header.addStretch()

@@ -1,14 +1,18 @@
 import sqlite3
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, patch
+
+from keyring.errors import KeyringError, KeyringLocked
 
 from maildesk.models import Account, MailItem, MailPage
 from maildesk.providers import provider_for_address
-from maildesk.service import MailService
+from maildesk.service import CredentialAccessPaused, KeyringVault, MailService
 
 
 class FakeVault:
@@ -27,6 +31,172 @@ class FakeVault:
 
     def delete(self, address):
         del self.values[address]
+
+
+class KeyringVaultTests(unittest.TestCase):
+    def setUp(self):
+        self.backend = Mock()
+        for override in (patch.object(KeyringVault, "_backend", return_value=self.backend),
+                         patch.object(KeyringVault, "_session_secrets", {}),
+                         patch.object(KeyringVault, "_paused", Event())):
+            override.start()
+            self.addCleanup(override.stop)
+
+    def test_concurrent_readers_share_an_authorization_across_instances(self):
+        entered, release = Event(), Event()
+
+        def authorize(service, address):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return "approved"
+
+        self.backend.get_password.side_effect = authorize
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(KeyringVault().get, "alice@qq.com")
+            try:
+                self.assertTrue(entered.wait(2))
+                other = pool.submit(KeyringVault().get, "alice@qq.com")
+            finally:
+                release.set()
+            self.assertEqual(first.result(), "approved")
+            self.assertEqual(other.result(), "approved")
+        self.assertEqual(KeyringVault().get("alice@qq.com"), "approved")
+        self.backend.get_password.assert_called_once_with(KeyringVault.service_name, "alice@qq.com")
+
+    def test_denial_suppresses_other_prompts_until_explicit_retry(self):
+        vault = KeyringVault()
+        self.backend.get_password.side_effect = ["qq-token", KeyringLocked(), "163-token"]
+        self.assertEqual(vault.get("alice@qq.com"), "qq-token")
+        with self.assertRaises(CredentialAccessPaused):
+            vault.get("alice@163.com")
+        with self.assertRaises(CredentialAccessPaused):
+            KeyringVault().get("reply-api/deepseek")
+        self.assertEqual(KeyringVault().get("alice@qq.com"), "qq-token")
+        self.assertEqual(self.backend.get_password.call_count, 2)
+        KeyringVault.resume_access()
+        self.assertEqual(vault.get("alice@163.com"), "163-token")
+
+    def test_mac_authorization_statuses_pause_other_reads_but_io_errors_do_not(self):
+        with patch("maildesk.service.sys.platform", "darwin"):
+            for status in (-128, -25293, -25308):
+                with self.subTest(status=status):
+                    KeyringVault.resume_access()
+                    failed = KeyringError()
+                    failed.__cause__ = Exception(status, "OSStatus")
+                    self.backend.get_password.side_effect = failed
+                    with self.assertRaises(CredentialAccessPaused):
+                        KeyringVault().get("alice@qq.com")
+                    self.backend.get_password.reset_mock()
+                    with self.assertRaises(CredentialAccessPaused):
+                        KeyringVault().get("alice@163.com")
+                    self.backend.get_password.assert_not_called()
+            KeyringVault.resume_access()
+            self.backend.get_password.side_effect = [KeyringError("transient"), None, "restored"]
+            with self.assertRaisesRegex(KeyringError, "transient"):
+                KeyringVault().get("alice@qq.com")
+            self.assertIsNone(KeyringVault().get("alice@qq.com"))
+            self.assertEqual(KeyringVault().get("alice@qq.com"), "restored")
+
+    def test_updates_deletions_and_failed_writes_invalidate_old_values(self):
+        vault = KeyringVault()
+        addr = "reply-api/deepseek"
+        self.backend.get_password.side_effect = ["initial", "after-partial-write", None]
+        self.assertEqual(vault.get(addr), "initial")
+        vault.set(addr, "updated")
+        self.assertEqual(KeyringVault().get(addr), "updated")
+        self.backend.set_password.side_effect = KeyringError("partial write")
+        with self.assertRaises(KeyringError):
+            vault.set(addr, "possible-change")
+        self.assertEqual(vault.get(addr), "after-partial-write")
+        KeyringVault().delete(addr)
+        self.assertIsNone(vault.get(addr))
+        self.backend.delete_password.assert_called_once_with(vault.service_name, addr)
+
+    def test_rebinding_compares_the_current_keychain_item_even_after_external_changes(self):
+        saved = {}
+        self.backend.get_password.side_effect = lambda service, addr: saved.get(addr)
+        self.backend.set_password.side_effect = lambda service, addr, value: saved.update({addr: value})
+        with tempfile.TemporaryDirectory() as folder:
+            service = MailService(Path(folder) / "accounts.sqlite", Mock(), KeyringVault())
+            addr = "alice@qq.com"
+            service.bind("qq", addr, "token")
+            service.bind("qq", addr, "token")
+            self.assertEqual(self.backend.set_password.call_count, 1)
+            saved[addr] = "externally-rotated"
+            service.bind("qq", addr, "token")
+            self.assertEqual(saved[addr], "token")
+            del saved[addr]
+            service.bind("qq", addr, "token")
+            self.assertEqual(saved[addr], "token")
+            self.assertEqual(self.backend.set_password.call_count, 3)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "uses system CoreFoundation types")
+class MacKeyringWriteTests(unittest.TestCase):
+    def setUp(self):
+        from maildesk import mac_keychain
+        self.mac = mac_keychain
+        self.keyring = self.mac.MacKeyring()
+        for function in ("_update", "_add"):
+            stub = patch.object(self.mac, function, return_value=0)
+            setattr(self, function, stub.start())
+            self.addCleanup(stub.stop)
+
+    def test_update_targets_the_existing_item_and_changes_only_binary_password_data(self):
+        import ctypes as C
+
+        mac = self.mac
+        count = mac._function(mac._cf, "CFDictionaryGetCount", C.c_long, C.c_void_p)
+        value = mac._function(mac._cf, "CFDictionaryGetValue", C.c_void_p, C.c_void_p, C.c_void_p)
+        string = mac._function(mac._cf, "CFStringGetCString", C.c_bool,
+                               C.c_void_p, C.c_char_p, C.c_long, C.c_uint32)
+        data = mac._function(mac._cf, "CFDataGetBytePtr", C.c_void_p, C.c_void_p)
+        length = mac._function(mac._cf, "CFDataGetLength", C.c_long, C.c_void_p)
+        password = "新\0token"
+
+        def check(query, updates):
+            self.assertEqual(count(query), 3)
+            self.assertEqual(value(query, mac._constant("kSecClass")), mac._constant("kSecClassGenericPassword"))
+            for field, expected in (("kSecAttrService", "personal-mail-assistant"), ("kSecAttrAccount", "alice@qq.com")):
+                buffer = C.create_string_buffer(64)
+                self.assertTrue(string(value(query, mac._constant(field)), buffer, len(buffer), mac._utf8))
+                self.assertEqual(buffer.value.decode(), expected)
+            self.assertEqual(count(updates), 1)
+            payload = value(updates, mac._constant("kSecValueData"))
+            self.assertEqual(C.string_at(data(payload), length(payload)), password.encode())
+            return 0
+
+        self._update.side_effect = check
+        self.keyring.set_password("personal-mail-assistant", "alice@qq.com", password)
+        self._add.assert_not_called()
+
+    def test_only_missing_items_are_added_and_concurrent_inserts_are_updated(self):
+        self._update.side_effect = [-25300, -25300, 0]
+        self._add.side_effect = [0, -25299]
+        for _ in range(2):
+            self.keyring.set_password("test-service", "alice", "new")
+        self.assertEqual(self._update.call_count, 3)
+        self.assertEqual(self._add.call_count, 2)
+
+    def test_denied_update_never_deletes_or_recreates_existing_credential(self):
+        backend = Mock(get_password=Mock(return_value="old"), set_password=self.keyring.set_password)
+        addr = "alice@qq.com"
+        with tempfile.TemporaryDirectory() as folder, patch.object(KeyringVault, "_backend", return_value=backend), \
+                patch.object(KeyringVault, "_session_secrets", {}), patch.object(KeyringVault, "_paused", Event()):
+            service = MailService(Path(folder) / "accounts.sqlite", Mock(), KeyringVault())
+            account = service.bind("qq", addr, "old")
+            self._update.return_value = -128
+            with self.assertRaises(CredentialAccessPaused):
+                service.bind("qq", addr, "new")
+            with self.assertRaises(CredentialAccessPaused):
+                KeyringVault().get(addr)
+            self.assertEqual(service.accounts(), [account])
+            self.assertEqual(backend.get_password.call_count, 2)
+            self._update.assert_called_once()
+            self._add.assert_not_called()
+            backend.delete_password.assert_not_called()
+            KeyringVault.resume_access()
+            self.assertEqual(KeyringVault().get(addr), "old")
 
 
 class AccountServiceTests(unittest.TestCase):

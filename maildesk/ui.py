@@ -29,6 +29,7 @@ from .reminder_popup import ReminderPopup
 from .reply_dialog import ReplyDialog
 from .reply_settings import ModelSettingsDialog, saved_choice, selected_model
 from .reply_suggestions import model_completer, reply_suggestions
+from .service import CredentialAccessPaused, KeyringVault, MailboxAuthorizationRequired
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -176,15 +177,16 @@ class _Signals(QObject):
 
 
 class _Job(QRunnable):
-    def __init__(self, number, function, signals):
+    def __init__(self, number, function, signals, stop=None):
         super().__init__()
         self.number = number
         self.function = function
         self.signals = signals
+        self.stop = stop
 
     def run(self):
         try:
-            result = self.function()
+            result = None if self.stop is not None and self.stop.is_set() else self.function()
         except Exception as exc:
             self.signals.finished.emit(self.number, None, exc)
         else:
@@ -303,7 +305,7 @@ class _BindDialog(QDialog):
 
     def set_busy(self, busy):
         self.busy = busy
-        self.cancel.setEnabled(not busy)
+        self.cancel.setText("关闭" if busy else "取消")
         self.submit.setEnabled(not busy)
         self.address.setEnabled(not busy)
         self.secret.setEnabled(not busy)
@@ -314,7 +316,10 @@ class _BindDialog(QDialog):
         self.status.setVisible(bool(message))
 
     def reject(self):
-        if not self.busy:
+        if self.busy:
+            self.secret.clear()
+            self.hide()
+        else:
             super().reject()
 
 
@@ -333,11 +338,14 @@ class MainWindow(QMainWindow):
         self.refresh_after_load = set()
         self.polling = set()
         self.reminder_errors = {}
+        self.authorization_needed = set()
+        self.authorizing = None
         self.queue_error = ""
         self.queue_items = {}
         self.notified_key = None
         self.finishing = set()
         self.closing = False
+        self.stop_sync = Event()
         self.active_address = None
         self.body_id = 0
         self.image_download_stop = Event()
@@ -421,9 +429,6 @@ class MainWindow(QMainWindow):
             hide_title_text(self)
 
     def closeEvent(self, event):
-        if self.model_settings is not None and self.model_settings.busy:
-            event.ignore()
-            return
         for draft in self.reply_drafts.values():
             if draft.dialog.sending:
                 draft.dialog.show()
@@ -435,6 +440,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("草稿未能保存，请在草稿箱查看详情后重试。")
             return
         self.closing = True
+        self.stop_sync.set()
+        if self.binding is not None:
+            self.binding.close()
         if self.chat_dialog is not None:
             self.chat_dialog.disable()
         if self.model_settings is not None:
@@ -590,7 +598,7 @@ class MainWindow(QMainWindow):
         self.subject, self.meta, self.body = self.reader.subject, self.reader.meta, self.reader.body
         self.body_retry = self.reader.retry
         self.body_retry.clicked.connect(self._retry_body)
-        self.reader.seen_retry.clicked.connect(self._sync_seen)
+        self.reader.seen_retry.clicked.connect(self._retry_seen)
         self.reader.complete.clicked.connect(self._complete_selected)
         self.reader.load_images.clicked.connect(lambda: self._load_external_images(retry=True))
         layout.addWidget(self.reader, 1)
@@ -636,10 +644,10 @@ class MainWindow(QMainWindow):
         self._render_rows()
         self._list_state()
 
-    def _run(self, operation, callback):
+    def _run(self, operation, callback, *, stop=None):
         self.job_id += 1
         self.jobs[self.job_id] = callback
-        self.pool.start(_Job(self.job_id, operation, self.signals))
+        self.pool.start(_Job(self.job_id, operation, self.signals, stop))
 
     @Slot(int, object, object)
     def _finished(self, number, result, error):
@@ -775,8 +783,8 @@ class MainWindow(QMainWindow):
         prompt.finished.connect(finished)
         prompt.open()
 
-    def _poll_reminders(self):
-        for account in self.accounts:
+    def _poll_reminders(self, accounts=None):
+        for account in (self.accounts if accounts is None else accounts):
             address = account.address
             if address in self.polling:
                 continue
@@ -784,6 +792,7 @@ class MainWindow(QMainWindow):
 
             def done(arrivals, error, address=address):
                 self.polling.discard(address)
+                self._track_authorization(address, error)
                 if error:
                     self.reminder_errors[address] = str(error)
                 else:
@@ -797,7 +806,7 @@ class MainWindow(QMainWindow):
                         self._render_rows()
                 self._list_state()
 
-            self._run(lambda a=account: self.service.poll_pending(a), done)
+            self._run(lambda a=account: self.service.poll_pending(a), done, stop=self.stop_sync)
         self._list_state()
 
     def _open_pending(self):
@@ -841,6 +850,8 @@ class MainWindow(QMainWindow):
         self._run(lambda: self.service.complete_pending(item), done)
 
     def _manual_refresh(self):
+        if self.nav_kind != "drafts":
+            KeyringVault.resume_access()
         self._refresh()
         if self.nav_kind != "drafts":
             self._poll_reminders()
@@ -906,6 +917,7 @@ class MainWindow(QMainWindow):
 
     def _open_binding(self, account):
         if self.binding is not None:
+            self.binding.show()
             self.binding.raise_()
             self.binding.activateWindow()
             return
@@ -922,6 +934,8 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
 
     def _bind(self, dialog):
+        if dialog.busy:
+            return
         address = dialog.email_address()
         provider = dialog.domain.currentData()
         secret = dialog.secret.text()
@@ -933,19 +947,25 @@ class MainWindow(QMainWindow):
             dialog.show_status(f"请填写{MAIL_PROVIDERS[provider].credential_label}。")
             dialog.secret.setFocus()
             return
+        KeyringVault.resume_access()
         dialog.set_busy(True)
-        dialog.show_status("正在验证邮箱并保存绑定…")
+        dialog.show_status("正在验证邮箱并保存绑定，可关闭此窗口。")
 
         def done(account, error):
             if self.binding is not dialog:
                 return
             dialog.set_busy(False)
             if error:
-                dialog.show_status(str(error))
-                dialog.secret.setFocus()
+                if dialog.isVisible():
+                    dialog.show_status(str(error))
+                    dialog.secret.setFocus()
+                else:
+                    self.statusBar().showMessage(f"绑定 {address} 失败：{error}")
+                    dialog.reject()
                 return
+            select = account.address if dialog.isVisible() else self.active_address
             dialog.accept()
-            self._load_accounts(account.address)
+            self._load_accounts(select)
 
         self._run(lambda: self.service.bind(provider, address, secret), done)
 
@@ -1018,14 +1038,63 @@ class MainWindow(QMainWindow):
                              if self.cursors.get(a.address) is not None and a.address not in self.failed])
 
     def _retry_list(self):
+        account = self._authorization_target()
+        if account:
+            self._authorize_sync(account)
+            return
         if self.nav_kind in ("pending", "drafts"):
             self._manual_refresh()
             return
         if not self.accounts:
             self._load_accounts()
             return
+        KeyringVault.resume_access()
         requests = [(a, self.failed[a.address][0]) for a in self._targets() if a.address in self.failed]
         self._request_pages(requests)
+
+    def _track_authorization(self, address, error):
+        if isinstance(error, (MailboxAuthorizationRequired, CredentialAccessPaused)):
+            self.authorization_needed.add(address)
+        elif error is None:
+            self.authorization_needed.discard(address)
+
+    def _authorization_target(self):
+        if self.nav_kind != "drafts":
+            return next((account for account in self._targets()
+                         if account.address in self.authorization_needed), None)
+        return None
+
+    def _authorize_sync(self, account):
+        if self.authorizing:
+            return
+        address = self.authorizing = account.address
+        KeyringVault.resume_access()
+        self._list_state()
+
+        def done(_, error):
+            self.authorizing = None
+            if error:
+                self.failed[address] = (None, str(error))
+                self.reminder_errors[address] = str(error)
+                if not isinstance(error, (MailboxAuthorizationRequired, CredentialAccessPaused)):
+                    self.authorization_needed.discard(address)
+                self._list_state()
+                return
+            self.authorization_needed.discard(address)
+            self.reminder_errors.pop(address, None)
+            if address in self.loading_accounts:
+                self.refresh_after_load.add(address)
+            else:
+                self._request_pages([(account, None)])
+            self._poll_reminders([account])
+            if self.reading_item and self.reading_item.account == address and self.nav_kind != "drafts":
+                if not self.body_ready:
+                    self._mail_changed(self.mail_list.currentItem())
+                else:
+                    self._sync_seen()
+            self._list_state()
+
+        self._run(lambda: self.service.authorize_mailbox(account), done, stop=self.stop_sync)
 
     def _request_pages(self, requests):
         for account, cursor in requests:
@@ -1040,6 +1109,7 @@ class MainWindow(QMainWindow):
             def done(page, error, account=account, cursor=cursor):
                 self.loading_accounts.discard(account.address)
                 confirmed = self.seen_during_page_load.pop(account.address)
+                self._track_authorization(account.address, error)
                 if error:
                     self.failed[account.address] = (cursor, str(error))
                     self.mailbox_flags.pop(account.address, None)
@@ -1078,7 +1148,7 @@ class MainWindow(QMainWindow):
                     self._request_pages([(account, None)])
                 self._list_state()
 
-            self._run(lambda a=account, c=cursor: self.service.list_messages(a, c), done)
+            self._run(lambda a=account, c=cursor: self.service.list_messages(a, c), done, stop=self.stop_sync)
         self._list_state()
 
     def _render_rows(self, keep_reading=None):
@@ -1131,6 +1201,13 @@ class MainWindow(QMainWindow):
             error_text = "\n".join(issues)
         else:
             error_text = "\n".join(f"{a}：{self.failed[a][1]}" for a in sorted(failures))
+        account = self._authorization_target()
+        if account:
+            error_text = (f"正在等待 {self.authorizing} 的钥匙串授权。" if self.authorizing
+                          else f"{account.address} 需要授权。桌面版会将该邮箱的授权码保存在系统钥匙串中，供下次自动同步。")
+        self.retry_button.setText("授权并记住" if account else "重试")
+        self.retry_button.setToolTip(f"授权并记住 {account.address}" if account else "")
+        self.retry_button.setEnabled(not (account and self.authorizing))
         self.notice_label.setText(error_text)
         self.notice.setVisible(bool(error_text))
         visible = self.mail_list.count()
@@ -1213,7 +1290,12 @@ class MainWindow(QMainWindow):
             self.empty_list.setText(message)
 
     def _retry_body(self):
+        KeyringVault.resume_access()
         self._mail_changed(self.mail_list.currentItem())
+
+    def _retry_seen(self):
+        KeyringVault.resume_access()
+        self._sync_seen()
 
     def _update_chat(self):
         model = self.reply_model
@@ -1323,6 +1405,7 @@ class MainWindow(QMainWindow):
 
     def _open_model_settings(self):
         if self.model_settings is not None:
+            self.model_settings.show()
             self.model_settings.raise_()
             self.model_settings.activateWindow()
             return
@@ -1341,6 +1424,8 @@ class MainWindow(QMainWindow):
                     draft.dialog.set_model(ai.description if ai else "", None, converse=converse, draft_with=writer,
                                            complete=model_completer(ai, draft.subject, draft.original_text,
                                                                     draft.envelope.recipient if draft.envelope else ""))
+            elif dialog.error.isVisibleTo(dialog):
+                self.statusBar().showMessage(dialog.error.text())
             self.model_settings = None
             dialog.deleteLater()
 
@@ -1501,6 +1586,8 @@ class MainWindow(QMainWindow):
             is_open = self.nav_kind != "drafts" and self.reading_item is not None and _key(self.reading_item) == key
             if error:
                 if is_open and self.body_ready:
+                    self._track_authorization(account.address, error)
+                    self._list_state()
                     self.reader.set_seen_status(f"已读状态同步失败：{error}", retry=True)
                 return
             # A FETCH started before STORE can arrive with the old flags.
@@ -1560,6 +1647,8 @@ class MainWindow(QMainWindow):
                 return
             self.body_ready = not error
             if error:
+                self._track_authorization(account.address, error)
+                self._list_state()
                 self.reader.set_body(f"正文读取失败：{error}", error=True)
                 return
             self.reader.set_content(content)
@@ -1569,4 +1658,4 @@ class MainWindow(QMainWindow):
             self._sync_seen()
             self._load_external_images()
 
-        self._run(lambda: self.service.read_content(account, item), done)
+        self._run(lambda: self.service.read_content(account, item), done, stop=self.stop_sync)

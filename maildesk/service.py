@@ -6,10 +6,11 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import Future
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
+from uuid import uuid4
 
 from .models import (
     DRAFT_CONTEXT_LIMIT, Account, InboxCursor, MailBody, MailItem, MailPage, MailQuery, MailSearchResult,
@@ -45,15 +46,34 @@ def _needs_attention(item: MailItem) -> bool:
     return bool(_ACTION_REQUEST.search(_NEGATED_REQUEST.sub("", text)))
 
 
+class CredentialAccessPaused(RuntimeError):
+    def __init__(self):
+        super().__init__("系统凭据库访问已暂停。需要联网时，点「刷新」重新授权。")
+
+
+class MailboxAuthorizationRequired(RuntimeError):
+    def __init__(self):
+        super().__init__("此邮箱需要钥匙串授权才能同步。")
+
+
 class KeyringVault:
     """Use the native credential store, including when alternate keyrings are installed."""
 
     service_name = "personal-mail-assistant"
+    # Inbox workers and AI model settings create separate vault instances.
+    _access = RLock()
+    _session_secrets: dict[str, str] = {}
+    _paused = Event()
+
+    @classmethod
+    def resume_access(cls) -> None:
+        """Allow another system prompt after an explicit user retry."""
+        cls._paused.clear()
 
     def _backend(self):
         try:
             if sys.platform == "darwin":
-                from keyring.backends.macOS import Keyring
+                from .mac_keychain import MacKeyring as Keyring
             elif sys.platform == "win32":
                 from keyring.backends.Windows import WinVaultKeyring as Keyring
             elif sys.platform.startswith("linux"):
@@ -64,14 +84,68 @@ class KeyringVault:
             raise RuntimeError("请安装 keyring 及当前系统的凭据库支持。") from exc
         return Keyring()
 
+    @contextmanager
+    def _system_access(self, *, quiet=False):
+        backend = self._backend()
+        from keyring.errors import KeyringError, KeyringLocked
+
+        try:
+            yield backend
+        except KeyringError as exc:
+            # macOS wraps several Security.framework authorization statuses in KeyringError.
+            cause = exc.__cause__
+            status = cause.args[0] if cause and cause.args else None
+            if isinstance(exc, KeyringLocked) or (sys.platform == "darwin" and status in (-128, -25293, -25308, -25315)):
+                if quiet:
+                    raise MailboxAuthorizationRequired() from exc
+                self._paused.set()
+                raise CredentialAccessPaused() from exc
+            raise
+
     def get(self, address: str) -> str | None:
-        return self._backend().get_password(self.service_name, address)
+        return self._read(address, quiet=False)
+
+    def get_for_mail(self, address: str, *, fresh=False) -> str | None:
+        return self._read(address, quiet=sys.platform == "darwin", fresh=fresh)
+
+    def _read(self, address: str, *, quiet: bool, fresh=False) -> str | None:
+        with self._access:
+            if not fresh and address in self._session_secrets:
+                return self._session_secrets[address]
+            if not quiet and self._paused.is_set():
+                raise CredentialAccessPaused()
+            with self._system_access(quiet=quiet) as backend:
+                read = backend.get_password_without_ui if quiet else backend.get_password
+                secret = read(self.service_name, address)
+            if secret is not None:
+                self._session_secrets[address] = secret
+            return secret
+
+    def get_for_update(self, address: str) -> str | None:
+        # A rebind must respect changes made directly in the system credential store.
+        with self._access:
+            self._session_secrets.pop(address, None)
+            return self.get(address)
 
     def set(self, address: str, secret: str) -> None:
-        self._backend().set_password(self.service_name, address, secret)
+        with self._access:
+            # A backend may modify an item before reporting a write failure.
+            self._session_secrets.pop(address, None)
+            with self._system_access() as backend:
+                backend.set_password(self.service_name, address, secret)
+            self._session_secrets[address] = secret
 
     def delete(self, address: str) -> None:
-        self._backend().delete_password(self.service_name, address)
+        with self._access:
+            self._session_secrets.pop(address, None)
+            with self._system_access() as backend:
+                backend.delete_password(self.service_name, address)
+
+    def discard_mail_copy(self, key_ref: str) -> None:
+        with self._access:
+            self._session_secrets.pop(key_ref, None)
+            with self._system_access(quiet=True) as backend:
+                backend.delete_password_without_ui(self.service_name, key_ref)
 
 
 def _account(provider: str, address: str) -> Account:
@@ -99,6 +173,12 @@ class MailService:
                 "CREATE TABLE IF NOT EXISTS accounts "
                 "(address TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL)"
             )
+            # Revisions protect an authorization awaiting user input from racing a rebind.
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS mailbox_key_refs (
+                    address TEXT PRIMARY KEY, key_ref TEXT NOT NULL, revision INTEGER NOT NULL
+                )
+            """)
             db.execute("""
                 CREATE TABLE IF NOT EXISTS arrival_cursors (
                     account TEXT PRIMARY KEY, validity TEXT NOT NULL, through_uid INTEGER NOT NULL
@@ -137,6 +217,24 @@ class MailService:
             rows = db.execute("SELECT address, provider FROM accounts ORDER BY rowid")
             return [_account(provider, address) for address, provider in rows]
 
+    @staticmethod
+    def _key_record(db, address):
+        record = db.execute("SELECT key_ref, revision FROM mailbox_key_refs WHERE address=?", (address,)).fetchone()
+        return MailService._validate_key_ref(address, *(record or (address, 0)))
+
+    @staticmethod
+    def _validate_key_ref(address, key_ref, revision):
+        if key_ref != address and not re.fullmatch(rf"mailbox/{re.escape(address)}/[0-9a-f]{{32}}", key_ref):
+            raise ValueError("邮箱的本机凭据引用无效。")
+        return key_ref, revision
+
+    @staticmethod
+    def _save_key_ref(db, address, key_ref):
+        db.execute("""
+            INSERT INTO mailbox_key_refs (address, key_ref, revision) VALUES (?, ?, 1)
+            ON CONFLICT(address) DO UPDATE SET key_ref=excluded.key_ref, revision=revision+1
+        """, (address, key_ref))
+
     def bind(self, provider: str, address: str, secret: str) -> Account:
         account = _account(provider, address)
         if not secret or not secret.strip():
@@ -156,32 +254,77 @@ class MailService:
                 "ON CONFLICT(address) DO UPDATE SET provider=excluded.provider",
                 (account.address, account.provider),
             )
-            previous = self._vault.get(account.address)
+            read_previous = getattr(self._vault, "get_for_update", self._vault.get)
+            key_ref, _ = self._key_record(db, account.address)
+            previous = read_previous(key_ref)
             try:
-                self._vault.set(account.address, secret)
+                if secret != previous:
+                    self._vault.set(key_ref, secret)
+                self._save_key_ref(db, account.address, key_ref)
                 db.commit()
+            except CredentialAccessPaused:
+                # A denied system update leaves the original item intact.
+                raise
             except Exception:
                 # Even a vault API can report failure after changing the item.
-                if self._vault.get(account.address) != previous:
+                if self._vault.get(key_ref) != previous:
                     if previous is None:
-                        self._vault.delete(account.address)
+                        self._vault.delete(key_ref)
                     else:
-                        self._vault.set(account.address, previous)
+                        self._vault.set(key_ref, previous)
                 raise
         return account
 
-    def _require_bound(self, account: Account) -> None:
+    def _require_bound(self, account: Account):
         with closing(self._connect()) as db:
-            row = db.execute(
-                "SELECT provider FROM accounts WHERE address = ?", (account.address,)
-            ).fetchone()
-            if row != (account.provider,) or _account(account.provider, account.address) != account:
+            row = db.execute("""
+                SELECT provider, coalesce(key_ref, address), coalesce(revision, 0)
+                FROM accounts LEFT JOIN mailbox_key_refs USING(address) WHERE address=?
+            """, (account.address,)).fetchone()
+            if row is None or row[0] != account.provider or _account(account.provider, account.address) != account:
                 raise ValueError("该邮箱账号尚未绑定。")
+            return self._validate_key_ref(account.address, row[1], row[2])
+
+    def authorize_mailbox(self, account: Account) -> None:
+        """Remember an explicitly selected mailbox after verifying prompt-free access."""
+        if sys.platform != "darwin" or not isinstance(self._vault, KeyringVault):
+            self._credentials(account)
+            return
+        with self._lock:
+            source, revision = self._require_bound(account)
+            # Measure access before asking. An approval may grant the old item
+            # to this process temporarily without persisting across launches.
+            try:
+                self._check_secret(account, self._vault.get_for_mail(source, fresh=True))
+                return
+            except MailboxAuthorizationRequired:
+                pass
+            secret = self._check_secret(account, self._vault.get_for_update(source))
+            # File-keychain ACLs on credentials created by a different executable
+            # may continue requiring approval. Keep the original for that executable.
+            replacement = f"mailbox/{account.address}/{uuid4().hex}"
+            self._vault.set(replacement, secret)
+            try:
+                if self._vault.get_for_mail(replacement, fresh=True) != secret:
+                    raise RuntimeError("新钥匙串条目未能通过免弹窗读取验证。")
+                with closing(self._connect()) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if self._key_record(db, account.address) != (source, revision):
+                        raise RuntimeError("此邮箱的授权已在另一处更新，请重新刷新。")
+                    self._save_key_ref(db, account.address, replacement)
+                    db.commit()
+            except Exception:
+                self._vault.discard_mail_copy(replacement)
+                raise
 
     def _credentials(self, account: Account) -> str:
         with self._lock:
-            self._require_bound(account)
-            secret = self._vault.get(account.address)
+            key_ref, _ = self._require_bound(account)
+            read = getattr(self._vault, "get_for_mail", self._vault.get)
+            return self._check_secret(account, read(key_ref))
+
+    @staticmethod
+    def _check_secret(account, secret):
         if not secret:
             label = MAIL_PROVIDERS[account.provider].credential_label
             raise ValueError(f"系统凭据库中没有该邮箱的{label}，请重新绑定。")

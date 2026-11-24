@@ -131,28 +131,63 @@ class ModelSettingsDialog(QDialog):
             self._show_error(f"请输入{PROVIDER_NAMES[provider]}的 API 密钥。")
             return
 
+        selection = {"provider": provider, "model": model}
+
+        def save_selection(settings):
+            if key:
+                settings.setValue(f"keys/{provider}", True)
+            settings.setValue("selection", selection)
+            settings.sync()
+            if settings.status() != QSettings.Status.NoError:
+                raise RuntimeError("无法保存模型设置，请检查本机设置目录的写入权限。")
+
         def finish(_, error):
             self.busy = False
-            self.setEnabled(True)
+            self.enabled.setEnabled(True)
+            self.fields.setEnabled(True)
+            self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(True)
+            self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
             if error:
-                self._show_error("系统凭据库未能保存密钥，请解锁凭据库后重试。")
+                self._show_mode()
+                self._show_error(str(error))
+                if not self.isVisible():
+                    self.reject()
                 return
-            if key:
-                self.settings.setValue(f"keys/{provider}", True)
-            self.settings.setValue("selection", {"provider": provider, "model": model})
             self.settings.sync()
-            if self.settings.status() != QSettings.Status.NoError:
-                self._show_error("无法保存模型设置，请检查本机设置目录的写入权限。")
-                return
             self.choice = provider, model
             self.key.clear()
             self.accept()
 
         if key:
+            # Each thread needs its own QSettings. Commit the preference alongside the
+            # key even if the user closes the window before the native prompt returns.
+            if self.settings.organizationName():
+                settings_args = (self.settings.format(), self.settings.scope(),
+                                 self.settings.organizationName(), self.settings.applicationName())
+            else:
+                settings_args = (self.settings.fileName(), self.settings.format())
+
+            def store():
+                try:
+                    KeyringVault().set(f"reply-api/{provider}", key)
+                except Exception as exc:
+                    raise RuntimeError("系统凭据库未能保存密钥，请解锁凭据库后重试。") from exc
+                save_selection(QSettings(*settings_args))
+
+            KeyringVault.resume_access()
             self.busy = True
-            self.setEnabled(False)
-            self.run(lambda: KeyringVault().set(f"reply-api/{provider}", key), finish)
+            self.enabled.setEnabled(False)
+            self.fields.setEnabled(False)
+            self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(False)
+            self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("关闭")
+            self.hint.setText("正在保存模型设置，可关闭此窗口。")
+            self.run(store, finish)
         else:
+            try:
+                save_selection(self.settings)
+            except RuntimeError as error:
+                self._show_error(str(error))
+                return
             finish(None, None)
 
     def _show_error(self, message):
@@ -160,6 +195,8 @@ class ModelSettingsDialog(QDialog):
         self.error.show()
 
     def reject(self):
-        if not self.busy:
-            self.key.clear()
+        self.key.clear()
+        if self.busy:
+            self.hide()
+        else:
             super().reject()

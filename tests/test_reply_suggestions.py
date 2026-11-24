@@ -82,16 +82,45 @@ class ReplySuggestionTests(unittest.TestCase):
                 self.assertIn(detail, result[0])
                 self.assertNotIn("邀请", "".join(result))
 
-    def test_no_reply_and_authentication_messages_do_not_offer_completions(self):
-        for address in ("noreply@service.test", "Do-Not-Reply@service.test"):
-            self.assertEqual(reply_suggestions("开票通知", "发票于今日开出。", address), ())
-            self.assertIsNone(model_completer(Mock(), "开票通知", "发票于今日开出。", address))
-        for subject, body in (("登录验证码 123456", "七分钟内有效"), ("通知", "此邮件无需回复。"),
-                              ("活动汇总", "请查看详情。\n--\n此邮箱无人值守。点击退订"),
-                              ("电子通行证", "您的验证码为123456，请妥善保管。"),
-                              ("Sign in", "Your verification code is 123456")):
-            with self.subTest(subject=subject, body=body):
-                self.assertEqual(reply_suggestions(subject, body), ())
+    def test_notification_completion_uses_the_request_and_ignores_delivery_disclaimers(self):
+        subject = "Journal of Cloud Computing – Author proofs"
+        request = "Please check equation 12 in your proofs."
+        for address, body in (
+            ("Do-Not-Reply@service.test", request),
+            ("noreply+proofs@service.test", "Please do not reply. " + request),
+            ("", request + "\n--\n此邮箱无人值守，请勿直接回复。"),
+        ):
+            with self.subTest(address=address, body=body):
+                suggestion, = reply_suggestions(subject, body, address)
+                self.assertIn("equation 12", suggestion)
+                self.assertNotIn("do not reply", suggestion.lower())
+                self.assertNotIn("无人值守", suggestion)
+
+                model = Mock()
+                model.complete.return_value = json.dumps({"suffix": "核对公式 12 的要求。",
+                                                          "evidence": "equation 12"})
+                complete = model_completer(model, subject, body, address)
+                model.complete.assert_not_called()
+                self.assertEqual(complete("确认收到"), "核对公式 12 的要求。")
+                context = json.loads(model.complete.call_args.args[0][-1]["content"])
+                self.assertEqual(context["最新正文"], request)
+                self.assertTrue(context["无需直接回复的通知"])
+
+        only_title = reply_suggestions(subject, "Please do not reply.", "no-reply@service.test")
+        self.assertIn("Author proofs", only_title[0])
+        self.assertIn("发票于今日开出", reply_suggestions("开票通知", "发票于今日开出。此邮件无需回复。")[0])
+        self.assertIn("第二段", reply_suggestions("来信", "请勿回复，请核对第二段的校样。")[0])
+
+    def test_authentication_codes_are_excluded_from_both_completion_paths(self):
+        for subject, body, address in (
+            ("登录验证码 123456", "七分钟内有效", ""),
+            ("电子通行证", "您的验证码为123456，请妥善保管。", ""),
+            ("Sign in", "Your verification code is 123456", ""),
+            ("Your one-time password", "JFKWTR", "do-not-reply@service.test"),
+        ):
+            with self.subTest(subject=subject, address=address):
+                self.assertEqual(reply_suggestions(subject, body, address), ())
+                self.assertIsNone(model_completer(Mock(), subject, body, address))
 
     def test_model_completion_is_grounded_in_latest_mail_and_uses_user_prefix(self):
         model = Mock()
@@ -110,4 +139,3 @@ class ReplySuggestionTests(unittest.TestCase):
             model.complete.return_value = json.dumps({"suffix": suffix, "evidence": quote})
             self.assertEqual(complete("我不方便"), "")
         self.assertIsNone(model_completer(model, "验证码 123456", "请在网页输入"))
-        self.assertIsNone(model_completer(model, "通知", "此邮箱无人值守，请勿回复。"))
