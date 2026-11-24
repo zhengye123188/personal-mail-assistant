@@ -4,7 +4,8 @@ from concurrent.futures import CancelledError
 from sqlite3 import Error as DatabaseError
 from threading import Event
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
@@ -12,6 +13,9 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 
 from .mail_visuals import icon, sender_display
+
+
+_DEADLINE_QUESTION = "找出最近一周邮件中的截止日期，帮我整理成待办"
 
 
 def _label(text, *, name="", selectable=False):
@@ -86,6 +90,25 @@ class _SourceButton(QPushButton):
         self._fit_text()
 
 
+class _MailboxScope(QComboBox):
+    """Keep both ends of an address legible in the compact window toolbar."""
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = self.rect().adjusted(1, 1, -1, -1)
+        painter.setBrush(QColor("#f5f7fa"))
+        painter.setPen(QColor("#377ac0" if self.hasFocus() else "#d8dfe6"))
+        painter.drawRoundedRect(QRectF(bounds), 6, 6)
+        middle = bounds.center().y()
+        icon("inbox", "#526a82", 15).paint(painter, QRect(8, middle - 7, 15, 15))
+        icon("chevron", "#526a82", 12).paint(painter, QRect(self.width() - 18, middle - 6, 12, 12))
+        text_rect = bounds.adjusted(28, 0, -22, 0)
+        display = self.fontMetrics().elidedText(self.currentText(), Qt.TextElideMode.ElideMiddle, text_rect.width())
+        painter.setPen(QColor("#263442"))
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, display)
+
+
 class ChatDialog(QDialog):
     open_mail = Signal(object)
     compose_reply = Signal(object, str)
@@ -95,12 +118,12 @@ class ChatDialog(QDialog):
 
     def __init__(self, parent=None, *, accounts, model_description, ask, run, store=None):
         super().__init__(parent)
+        self.pages = None
         self.setObjectName("chatDialog")
         self.setWindowTitle("邮箱助手")
-        self.resize(650, 660)
+        self.resize(700, 660)
         self.setMinimumSize(390, 420)
         self._store = store
-        self.pages = None
         self._run = run
         self._ask = ask
         self._conversation_id = 0
@@ -113,11 +136,16 @@ class ChatDialog(QDialog):
         self.setStyleSheet("""
             QDialog#chatDialog, QWidget#chatTranscript, QWidget#chatWelcome { background: white; color: #252529; }
             QLabel#chatWelcomeTitle { color: #26262b; font-size: 22px; font-weight: bold; }
-            QLabel#chatModel, QLabel#chatRole, QLabel#chatScopeLabel { color: #686872; font-size: 12px; }
+            QLabel#chatModel, QLabel#chatRole { color: #626b77; font-size: 12px; }
             QLabel#chatQuestion { color: #184471; background: #edf4fd; padding: 9px 13px; border-radius: 11px; }
             QLabel#chatAnswer, QLabel#chatDraftText { color: #26262b; font-size: 14px; }
             QFrame#chatDraftCard { background: #f8fafc; border: 1px solid #dfe5ec; border-radius: 8px; }
-            QFrame#chatRule { background: #e6e6eb; }
+            QFrame#deadlineProposal { background: #f6f8fb; border: 1px solid #d9e1eb; border-radius: 9px; }
+            QLabel#deadlineHeading { color: #263442; font-size: 15px; font-weight: bold; }
+            QLabel#deadlineQuote { color: #364456; background: white; padding: 6px 9px; border-left: 2px solid #8caecc; }
+            QPushButton#confirmDeadline { color: white; background: #1469c2; border: 0; border-radius: 6px; padding: 6px 11px; }
+            QPushButton#confirmDeadline:hover { background: #0c599e; }
+            QPushButton#confirmDeadline:disabled { color: #3e6652; background: #e7f0ea; }
             QScrollArea#chatScroll, QPlainTextEdit#chatInput { border: none; background: white; color: #26262b; }
             QFrame#chatComposer { border: 1px solid #d4d8df; border-radius: 12px; background: white; }
             QPushButton#chatSource, QPushButton#chatSuggestion {
@@ -126,57 +154,69 @@ class ChatDialog(QDialog):
             }
             QPushButton#chatSource:hover, QPushButton#chatSuggestion:hover { background: #edf4fc; }
             QPushButton#chatSubmit:enabled { background: #087af2; color: white; border: 0; border-radius: 8px; padding: 6px 14px; }
-            QPushButton#chatReset, QPushButton#chatCompose { background: #edf3fa; color: #1767a9; border: 0; border-radius: 7px; padding: 6px 10px; }
+            QPushButton#chatCompose { background: #edf3fa; color: #1767a9; border: 0; border-radius: 7px; padding: 6px 10px; }
+            QPushButton#chatReset { background: transparent; color: #56606e; border: 0; border-radius: 5px; padding: 5px; }
+            QPushButton#chatReset:hover, QPushButton#chatReset:focus { background: #eaf0f6; }
             QLabel#chatStatus, QLabel#agentHelp { color: #646470; }
-            QTabWidget::pane { border: none; border-top: 1px solid #e6e6eb; }
-            QTabBar::tab { padding: 7px 17px; color: #616875; background: white; }
-            QTabBar::tab:selected { color: #1767a9; border-bottom: 2px solid #337fc0; }
-            QTabBar::tab:hover { background: #f0f5fa; }
-            QListWidget#agentTasks { border: 1px solid #e2e5e9; border-radius: 6px; background: white; }
-            QListWidget#agentTasks::item { padding: 7px 8px; }
-            QListWidget#agentTasks::item:selected { background: #edf4fd; color: #184471; }
+            QTabWidget#agentWorkspace::pane { border: 0; border-top: 1px solid #dce1e7; }
+            QTabWidget#agentWorkspace::tab-bar { alignment: left; left: 10px; }
+            QTabBar#agentNavigation { background: white; }
+            QTabBar#agentNavigation::tab {
+                padding: 9px 11px; margin: 5px 1px; background: white;
+                border-radius: 7px; color: #495464; font-size: 13px;
+            }
+            QTabBar#agentNavigation::tab:hover { background: #f1f3f6; }
+            QTabBar#agentNavigation::tab:selected { background: #e9f1fb; color: #155d9e; font-weight: bold; }
+            QComboBox#agentScope QAbstractItemView { background: white; color: #263442;
+                    selection-background-color: #e1eefa; selection-color: #174b7f; }
         """)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 14)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        top = QHBoxLayout()
-        top.setContentsMargins(18, 13, 18, 10)
-        self.scope = QComboBox()
+        self.scope_bar = QWidget()
+        top = QHBoxLayout(self.scope_bar)
+        top.setContentsMargins(4, 3, 12, 3)
+        self.scope = _MailboxScope()
+        self.scope.setObjectName("agentScope")
         self.scope.setAccessibleName("查询邮箱范围")
         self.scope.setToolTip("切换此范围的对话和待办")
-        self.scope.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        scope_label = QLabel("查询范围")
-        scope_label.setObjectName("chatScopeLabel")
-        scope_label.setBuddy(self.scope)
-        top.addWidget(scope_label)
-        top.addWidget(self.scope, 1)
+        self.scope.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.scope.setMinimumContentsLength(9)
+        self.scope.setFixedHeight(29)
+        top.addWidget(self.scope)
         self.new_chat = _button("清除对话" if store is not None else "新对话", "chatReset")
         self.new_chat.setToolTip("清除当前查询范围的对话记忆")
-        top.addWidget(self.new_chat)
-        layout.addLayout(top)
-        line = QFrame()
-        line.setObjectName("chatRule")
-        line.setFixedHeight(1)
-        layout.addWidget(line)
 
         if store is not None:
             from .agent_widgets import PreferencePage, TaskPage
 
             self.pages = QTabWidget()
+            self.pages.setObjectName("agentWorkspace")
             self.pages.setDocumentMode(True)
+            self.pages.tabBar().setObjectName("agentNavigation")
+            self.pages.tabBar().setAccessibleName("助手导航")
+            self.pages.tabBar().setDrawBase(False)
+            self.pages.tabBar().setUsesScrollButtons(False)
+            self.pages.tabBar().setExpanding(False)
+            self.pages.setCornerWidget(self.scope_bar)
+            top.setContentsMargins(4, 0, 12, 0)
             layout.addWidget(self.pages, 1)
             conversation = QWidget()
-            self.pages.addTab(conversation, "对话")
+            self.pages.addTab(conversation, icon("conversation", "#45647f", 16), "对话")
             self.tasks = TaskPage(store)
             self.tasks.open_mail.connect(self.open_mail)
             self.tasks.changed.connect(self.tasks_changed)
-            self.pages.addTab(self.tasks, "待办")
+            self.tasks.request_conversation.connect(self._start_deadline_query)
+            self.pages.addTab(self.tasks, icon("checklist", "#45647f", 16), "待办")
             self.prefs = PreferencePage(store)
             self.prefs.changed.connect(self.tasks_changed)
-            self.pages.addTab(self.prefs, "偏好")
+            self.pages.addTab(self.prefs, icon("preferences", "#45647f", 16), "偏好")
             self.pages.currentChanged.connect(self._page_changed)
+            self._fit_navigation()
             layout = QVBoxLayout(conversation)
-            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setContentsMargins(0, 0, 0, 12)
+        else:
+            layout.addWidget(self.scope_bar, 0, Qt.AlignmentFlag.AlignRight)
         self.stack = QStackedWidget()
         layout.addWidget(self.stack, 1)
         welcome = QWidget()
@@ -195,7 +235,7 @@ class ChatDialog(QDialog):
         self.suggestions = []
         questions = ["最近有哪些邮件需要回复？", "总结最近一周的来信"]
         if store is not None:
-            questions.append("找出最近一周邮件中的截止日期，帮我整理成待办")
+            questions.append(_DEADLINE_QUESTION)
         for question in questions:
             suggestion = _button(question, "chatSuggestion")
             suggestion.clicked.connect(lambda checked=False, q=question: self._send(q))
@@ -234,6 +274,7 @@ class ChatDialog(QDialog):
         actions = QHBoxLayout()
         self.model_label = _label("", name="chatModel")
         actions.addWidget(self.model_label, 1)
+        actions.addWidget(self.new_chat)
         self.send_button = _button("提问", "chatSubmit")
         actions.addWidget(self.send_button)
         box.addLayout(actions)
@@ -242,6 +283,7 @@ class ChatDialog(QDialog):
 
         self.new_chat.clicked.connect(self._clear_history)
         self.scope.currentIndexChanged.connect(self.reset)
+        self.scope.currentTextChanged.connect(self._scope_tooltip)
         self.input.textChanged.connect(self._update_controls)
         self.input.submitted.connect(self._submit)
         self.send_button.clicked.connect(self._click_submit)
@@ -253,15 +295,33 @@ class ChatDialog(QDialog):
         self.scope.blockSignals(True)
         self._accounts = tuple(accounts)
         self.scope.clear()
-        self.scope.addItem("全部收件箱", "")
+        inbox_icon = icon("inbox", "#527088", 15)
+        self.scope.addItem(inbox_icon, "全部收件箱", "")
         for account in self._accounts:
-            self.scope.addItem(account.address, account.address)
+            self.scope.addItem(inbox_icon, account.address, account.address)
         self.scope.setCurrentIndex(max(0, self.scope.findData(previous)))
         self.scope.blockSignals(False)
+        self._scope_tooltip(self.scope.currentText())
         self._ask = ask
+        if self.pages is not None:
+            self.tasks.set_chat_available(bool(ask and self._accounts))
         self.model_label.setText(f"提问时，问题、偏好和相关邮件节选将交给{model_description}。"
                                  if ask else "启用 AI 后可在这里查信、总结和提取待办。")
         self.reset()
+
+    def _scope_tooltip(self, name):
+        self.scope.setToolTip(f"{name} · 切换邮箱范围")
+
+    def _fit_navigation(self):
+        if self.pages is not None:
+            size = 0 if self.width() < 480 else 16
+            self.pages.setIconSize(QSize(size, size))
+            self.scope_bar.setFixedHeight(self.pages.tabBar().sizeHint().height())
+            self.scope.setFixedWidth(min(220, max(135, self.width() - 285)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_navigation()
 
     def _scope_addresses(self):
         selected = self.scope.currentData()
@@ -282,9 +342,14 @@ class ChatDialog(QDialog):
         if self.pages is not None:
             self.pages.setCurrentIndex(0)
 
+    def _start_deadline_query(self):
+        self.show_conversation()
+        if self._pending is None and not self.input.toPlainText().strip():
+            self.input.setPlainText(_DEADLINE_QUESTION)
+        self.input.setFocus()
+
     def _page_changed(self, index):
-        self.new_chat.setVisible(index == 0)
-        self.scope.setEnabled(self.pages.currentWidget() is not self.prefs)
+        self.scope_bar.setVisible(self.pages.currentWidget() is not self.prefs)
         if self.pages.currentWidget() is self.tasks:
             self.tasks.refresh()
 
@@ -349,7 +414,7 @@ class ChatDialog(QDialog):
         self.input.setEnabled(available)
         self.send_button.setEnabled(available and (busy or bool(self.input.toPlainText().strip())))
         self.send_button.setText("停止" if busy else "提问")
-        self.new_chat.setEnabled(bool(self.history or busy or self.input.toPlainText()))
+        self.new_chat.setVisible(bool(self.history or busy or self.input.toPlainText()))
         for suggestion in self.suggestions:
             suggestion.setEnabled(available and not busy)
 

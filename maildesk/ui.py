@@ -122,6 +122,12 @@ QMainWindow, QWidget#mailSurface, QWidget#listPane, QWidget#readingColumn, QDial
 }
 QLabel#viewHeading, QDialog QLabel { color: #202124; }
 QFrame#sidebar { background: #f5f5f7; border-radius: 16px; }
+QPushButton#mailChat, QPushButton#deadlineTasks {
+    text-align: left; color: #244667; border: 0; border-radius: 7px; padding: 7px 12px; }
+QPushButton#mailChat { background: #e2ecf7; }
+QPushButton#mailChat:hover { background: #d7e6f7; }
+QPushButton#deadlineTasks { background: transparent; }
+QPushButton#deadlineTasks:hover { background: #e7eaf0; }
 QListWidget { border: 0; outline: none; background: transparent; }
 QSplitter::handle { background: #e4e4e7; }
 QFrame#toolbarGroup { background: #f3f3f5; border-radius: 16px; }
@@ -481,13 +487,13 @@ class MainWindow(QMainWindow):
         self.account_list.currentItemChanged.connect(self._account_changed)
         layout.addWidget(self.account_list, 1)
         self.chat_button = _button("邮箱助手", "mailChat")
-        self.chat_button.setStyleSheet("QPushButton {color: #185997; background: #e2ecf7; border: none;"
-                                       " border-radius: 7px; padding: 7px;} QPushButton:hover {background: #d7e6f7}")
+        self.chat_button.setIcon(icon("conversation", "#36628b", 16))
         self.chat_button.setToolTip("跨邮箱查信、总结来信、提取截止日期或起草回复")
         self.chat_button.clicked.connect(self._open_chat)
         self.chat_button.setVisible(self.reply_model is not None)
         layout.addWidget(self.chat_button)
         self.deadlines_button = _button("截止待办", "deadlineTasks")
+        self.deadlines_button.setIcon(icon("checklist", "#466786", 16))
         self.deadlines_button.setToolTip("查看已确认的截止时间、原邮件和完成状态")
         self.deadlines_button.clicked.connect(self._open_tasks)
         layout.addWidget(self.deadlines_button)
