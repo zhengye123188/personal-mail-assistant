@@ -124,7 +124,7 @@ class ChatDialog(QDialog):
         self.pages = None
         self.setObjectName("chatDialog")
         self.setWindowTitle("邮箱助手")
-        self.resize(700, 660)
+        self.resize(840 if store is not None else 700, 660)
         self.setMinimumSize(390, 420)
         self._store = store
         self._run = run
@@ -138,7 +138,8 @@ class ChatDialog(QDialog):
         self._threads = ()
         self._turn_count = 0
         self._offset = 0
-        self.conversation_bar = None
+        self.conversation_sidebar = None
+        self._browsing_history = False
         self._pending = None
         self._question_row = None
         self._active_question = ""
@@ -169,6 +170,7 @@ class ChatDialog(QDialog):
             QPushButton#chatCompose { background: #edf3fa; color: #1767a9; border: 0; border-radius: 7px; padding: 6px 10px; }
             QPushButton#chatReset { background: transparent; color: #56606e; border: 0; border-radius: 5px; padding: 5px; }
             QPushButton#chatReset:hover, QPushButton#chatReset:focus { background: #eaf0f6; }
+            QFrame#historyPane { background: #f7f8fa; }
             QLabel#chatStatus, QLabel#agentHelp { color: #646470; }
             QTabWidget#agentWorkspace::pane { border: 0; border-top: 1px solid #dce1e7; }
             QTabWidget#agentWorkspace::tab-bar { alignment: left; left: 10px; }
@@ -198,7 +200,7 @@ class ChatDialog(QDialog):
         top.addWidget(self.scope)
         if store is not None:
             from .agent_widgets import PreferencePage, TaskPage
-            from .conversation_bar import ConversationBar
+            from .conversation_sidebar import ConversationSidebar
 
             self.pages = QTabWidget()
             self.pages.setObjectName("agentWorkspace")
@@ -222,16 +224,35 @@ class ChatDialog(QDialog):
             self.prefs.changed.connect(self.tasks_changed)
             self.pages.addTab(self.prefs, icon("preferences", "#45647f", 16), "偏好")
             self.pages.currentChanged.connect(self._page_changed)
-            self._fit_navigation()
-            layout = QVBoxLayout(conversation)
+            panes = QHBoxLayout(conversation)
+            panes.setContentsMargins(0, 0, 0, 0)
+            panes.setSpacing(0)
+            self.history_pane = QFrame()
+            self.history_pane.setObjectName("historyPane")
+            history_layout = QVBoxLayout(self.history_pane)
+            history_layout.setContentsMargins(0, 0, 0, 0)
+            history_layout.setSpacing(0)
+            self.history_back = _button("返回对话", "chatReset")
+            self.history_back.clicked.connect(lambda: self._show_history(False))
+            history_layout.addWidget(self.history_back, 0, Qt.AlignmentFlag.AlignLeft)
+            self.conversation_sidebar = ConversationSidebar()
+            history_layout.addWidget(self.conversation_sidebar, 1)
+            panes.addWidget(self.history_pane)
+            self.new_chat = self.conversation_sidebar.new_button
+            self.conversation_sidebar.selected.connect(self._select_thread)
+            self.conversation_sidebar.new_requested.connect(self._new_thread)
+            self.conversation_sidebar.delete_requested.connect(self._confirm_delete)
+
+            self.chat_pane = QWidget()
+            panes.addWidget(self.chat_pane, 1)
+            layout = QVBoxLayout(self.chat_pane)
             layout.setContentsMargins(0, 0, 0, 12)
             layout.setSpacing(0)
-            self.conversation_bar = ConversationBar()
-            self.new_chat = self.conversation_bar.new_button
-            layout.addWidget(self.conversation_bar)
-            self.conversation_bar.selected.connect(self._select_thread)
-            self.conversation_bar.new_requested.connect(self._new_thread)
-            self.conversation_bar.delete_requested.connect(self._confirm_delete)
+            self.history_button = _button("历史对话", "chatReset")
+            self.history_button.setIcon(icon("sidebar", "#526a82", 16))
+            self.history_button.clicked.connect(lambda: self._show_history(True))
+            layout.addWidget(self.history_button, 0, Qt.AlignmentFlag.AlignLeft)
+            self._fit_navigation()
             self.page_nav = QWidget()
             nav = QHBoxLayout(self.page_nav)
             nav.setContentsMargins(16, 3, 16, 0)
@@ -350,6 +371,29 @@ class ChatDialog(QDialog):
             self.pages.setIconSize(QSize(size, size))
             self.scope_bar.setFixedHeight(self.pages.tabBar().sizeHint().height())
             self.scope.setFixedWidth(min(220, max(135, self.width() - 285)))
+            compact = self.width() < 640
+            self.conversation_sidebar.set_compact(compact)
+            if not compact and self._browsing_history:
+                self._browsing_history = False
+                self._refresh_conversations()
+            self.history_pane.setMaximumWidth(self.width() if compact else 214)
+            self.history_pane.setMinimumWidth(0 if compact else 214)
+            self.history_pane.setVisible(not compact or self._browsing_history)
+            self.chat_pane.setVisible(not self._browsing_history)
+            self.history_button.setVisible(compact)
+            self.history_back.setVisible(compact)
+
+    def _show_history(self, visible):
+        self._browsing_history = visible
+        self._refresh_conversations()
+        self._fit_navigation()
+        if self._browsing_history:
+            target = self.conversation_sidebar.list if self._threads else self.new_chat
+            target.setFocus()
+        elif self.input.isEnabled():
+            self.input.setFocus()
+        else:
+            self.history_button.setFocus()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -373,6 +417,8 @@ class ChatDialog(QDialog):
     def show_conversation(self):
         if self.pages is not None:
             self.pages.setCurrentIndex(0)
+            if self._browsing_history:
+                self._show_history(False)
 
     def _start_deadline_query(self):
         self.show_conversation()
@@ -386,22 +432,25 @@ class ChatDialog(QDialog):
             self.tasks.refresh()
 
     def _select_thread(self, thread_id):
-        self._chosen[self._view_scope] = thread_id
-        self.reset()
-        self.input.setFocus()
+        if thread_id != self._thread_id:
+            self._chosen[self._view_scope] = thread_id
+            self.reset()
+        if self._browsing_history:
+            self._show_history(False)
 
-    def _refresh_conversation_bar(self):
+    def _refresh_conversations(self):
         self._turn_count = next((t.turn_count for t in self._threads if t.id == self._thread_id), 0)
-        self.conversation_bar.set_conversations(self._threads, self._thread_id)
+        self.conversation_sidebar.set_conversations(self._threads, self._thread_id)
 
     def _new_thread(self):
-        if self._thread_id is None:
-            self._cancel()
-            self.input.clear()
-        self._select_thread(None)
+        self._chosen[self._view_scope] = None
+        self.reset(remember=self._thread_id is not None)
+        if self._browsing_history:
+            self._show_history(False)
+        self.input.setFocus()
 
-    def _confirm_delete(self):
-        scope, thread_id = self._view_scope, self._thread_id
+    def _confirm_delete(self, thread_id):
+        scope = self._view_scope
         thread = next((item for item in self._threads if item.id == thread_id), None)
         if thread is None:
             return
@@ -409,7 +458,10 @@ class ChatDialog(QDialog):
         prompt.setObjectName("deleteConversationPrompt")
         prompt.setWindowTitle("删除对话")
         prompt.setTextFormat(Qt.TextFormat.PlainText)
-        prompt.setText(f"删除「{thread.title}」的全部聊天记录？")
+        title = thread.title
+        if sum(t.title == title for t in self._threads) > 1:
+            title = f"#{thread_id}  {title}"
+        prompt.setText(f"删除「{title}」的全部聊天记录？")
         prompt.setInformativeText("这段对话删除后无法恢复。")
         cancel = prompt.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         delete = prompt.addButton("删除对话", QMessageBox.ButtonRole.DestructiveRole)
@@ -432,7 +484,11 @@ class ChatDialog(QDialog):
             if self._chosen.get(scope) == thread_id:
                 self._chosen.pop(scope, None)
             if self._view_scope == scope:
-                self.reset(remember=self._thread_id != thread_id)
+                if self._thread_id == thread_id:
+                    self.reset(remember=False)
+                else:
+                    self._threads = tuple(t for t in self._threads if t.id != thread_id)
+                    self._refresh_conversations()
 
         prompt.finished.connect(finished)
         prompt.open()
@@ -531,7 +587,7 @@ class ChatDialog(QDialog):
                 except (DatabaseError, OSError) as exc:
                     self._set_status(f"读取对话记忆失败：{exc}")
                 self._render_turns(self.history)
-            self._refresh_conversation_bar()
+            self._refresh_conversations()
         self._update_controls()
 
     def _set_status(self, text):
@@ -544,7 +600,7 @@ class ChatDialog(QDialog):
         self.input.setEnabled(available)
         self.send_button.setEnabled(available and (busy or bool(self.input.toPlainText().strip())))
         self.send_button.setText("停止" if busy else "提问")
-        if self.conversation_bar is None:
+        if self.conversation_sidebar is None:
             self.new_chat.setVisible(bool(self.history or busy or self.input.toPlainText()))
         else:
             self.new_chat.setEnabled(bool(self._accounts))
@@ -641,7 +697,7 @@ class ChatDialog(QDialog):
                 else:
                     try:
                         self._threads = self._store.list_conversations(scope)
-                        self._refresh_conversation_bar()
+                        self._refresh_conversations()
                     except (DatabaseError, OSError) as exc:
                         self._set_status(f"对话已保存，刷新会话列表失败：{exc}")
                 if len(self.history) > HISTORY_LIMIT:

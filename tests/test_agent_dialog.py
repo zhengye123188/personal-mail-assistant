@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from maildesk.agent_store import AgentStore, HISTORY_LIMIT
@@ -124,15 +126,20 @@ class AgentDialogTests(unittest.TestCase):
 
     def test_unconfirmed_card_survives_switch_and_confirmed_card_stays_resolved(self):
         d = self.dialog()
+        d.show()
         self.send(d)
-        bar = d.conversation_bar
-        thread = bar.selector.currentData()
-        bar.new_button.click()
-        bar.selector.setCurrentIndex(bar.selector.findData(thread))
+        sidebar = d.conversation_sidebar
+
+        def reopen_thread():
+            sidebar.new_button.click()
+            self.app.processEvents()
+            rect = sidebar.list.visualItemRect(sidebar.list.item(0))
+            QTest.mouseClick(sidebar.list.viewport(), Qt.MouseButton.LeftButton, pos=rect.center())
+
+        reopen_thread()
         card, = d.messages.itemAt(1).widget().findChildren(DeadlineCard)
         card.confirm.click()
-        bar.new_button.click()
-        bar.selector.setCurrentIndex(bar.selector.findData(thread))
+        reopen_thread()
         self.assertFalse(d.messages.itemAt(1).widget().findChildren(DeadlineCard))
         self.assertEqual(len(self.store.list_tasks(self.accounts)), 1)
 
