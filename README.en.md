@@ -43,7 +43,13 @@ On a Mac, open **Apple menu → About This Mac** to check your chip or processor
 
 **macOS.** Open the DMG, drag **个人邮件助手** into **Applications**, then launch it from there. Python and the HTML reader are included. When upgrading, quit the previous version before replacing the app. If you previously ran from source, quit that instance first. The desktop app can use your existing accounts and drafts.
 
-The Mac app is locally signed and has not been notarized by Apple. If macOS cannot verify the developer on first launch, check that you downloaded the installer from this repository, then go to **System Settings → Privacy & Security → Open Anyway**. [Apple’s instructions](https://support.apple.com/en-us/102445)
+**If Apple cannot verify the app on first launch.** The v0.2.0 Mac app is locally signed and has not been notarized by Apple. If you downloaded the installer from this repository’s GitHub Release and trust this version, follow these steps.
+
+1. In the alert with **Done** and **Move to Trash**, click **Done** to keep the app.
+2. Open **System Settings → Privacy & Security**. Scroll down to **Security** and click **Open Anyway** next to **个人邮件助手**.
+3. Authenticate if prompted, then click **Open** in the confirmation dialog. macOS remembers this choice for the app, so you can open it from **Applications** as usual next time.
+
+If **Open Anyway** is missing, double-click **个人邮件助手** in **Applications** again, dismiss the alert, and return to **Privacy & Security**. [Apple’s instructions](https://support.apple.com/en-us/102445)
 
 **Windows.** Run the x64 installer, follow the prompts, then open **个人邮件助手** from the Start menu. The installer sets up the app for the current user and includes its runtime. The Windows installer is unsigned.
 
