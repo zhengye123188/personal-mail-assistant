@@ -1,6 +1,13 @@
 name: Build desktop installers
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Installers to build
+        type: choice
+        default: both
+        options: [both, windows, intel-mac]
 
 permissions:
   contents: read
@@ -8,6 +15,7 @@ permissions:
 jobs:
   windows:
     name: Windows x64 installer
+    if: inputs.platform != 'intel-mac'
     runs-on: windows-2025
     timeout-minutes: 35
     steps:
@@ -39,6 +47,7 @@ jobs:
 
   intel-mac:
     name: Intel Mac installer
+    if: inputs.platform != 'windows'
     runs-on: macos-26-intel
     timeout-minutes: 35
     steps:
