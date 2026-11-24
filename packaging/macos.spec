@@ -23,12 +23,12 @@ app = BUNDLE(
     name="个人邮件助手.app",
     icon=str(packaging_dir / "maildesk.icns"),
     bundle_identifier="io.github.zhengye123188.personal-mail-assistant",
-    version="0.1.2",
+    version=(packaging_dir / "VERSION").read_text(encoding="ascii").strip(),
     info_plist={
         "CFBundleDisplayName": "个人邮件助手",
         "CFBundleDevelopmentRegion": "zh_CN",
-        "CFBundleVersion": "3",
-        # The arm64 Qt 6.12 bindings included in this build target macOS 26.
+        "CFBundleVersion": "4",
+        # The bundled Qt 6.12 Python bindings target macOS 26.
         "LSMinimumSystemVersion": "26.0",
         "LSApplicationCategoryType": "public.app-category.productivity",
         "NSHighResolutionCapable": True,
