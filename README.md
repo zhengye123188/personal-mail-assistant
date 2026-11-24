@@ -1,10 +1,26 @@
-# 个人邮件助手
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/brand/maildesk-header-dark.svg">
+    <img src="./docs/brand/maildesk-header-light.svg" width="480" alt="MailDesk · 个人邮件助手">
+  </picture>
+</p>
 
-简体中文 · [English](./README.en.md)
+<h3 align="center">多个邮箱，一个收件箱。</h3>
 
-在一个桌面窗口里查看和回复 QQ、网易 163、126、Yeah、Gmail、iCloud 和 Yahoo 邮件。绑定邮箱即可使用，AI 助手默认关闭。
+<p align="center">
+  用个人邮件助手收发 QQ、网易、Gmail、iCloud 和 Yahoo 邮件。<br>
+  需要时开启 AI，查找来信、起草回复，或把邮件里的截止日期加入待办。
+</p>
 
-**下载桌面版 v0.2.0**
+<p align="center">
+  <a href="https://github.com/zhengye123188/personal-mail-assistant/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-2453E8?style=flat-square" alt="查看 v0.2.0 发布说明"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-475569?style=flat-square" alt="MIT 许可证"></a>
+  <a href="#下载安装包"><img src="https://img.shields.io/badge/download-macOS%20%2F%20Windows-35618A?style=flat-square" alt="下载 macOS 或 Windows 安装包"></a>
+</p>
+
+<p align="center"><strong>简体中文</strong> · <a href="./README.en.md" lang="en">English</a></p>
+
+## 下载安装包
 
 | 电脑 | 系统要求 | 安装包 |
 | --- | --- | --- |
@@ -69,7 +85,7 @@ macOS 完成安装后，也可以双击 [启动邮件助手.command](./启动邮
 
 点左下角「添加邮箱账户」。例如绑定 `name@gmail.com`，在账号框输入 `name`，右侧选择 `@gmail.com`。也可以直接粘贴完整地址。
 
-- 绑定 **QQ 或网易邮箱**时，在邮箱网页版开启 IMAP/SMTP 服务，生成客户端授权码。
+- 绑定 **QQ 或网易邮箱（163、126、Yeah）**时，在邮箱网页版开启 IMAP/SMTP 服务，生成客户端授权码。
 - 绑定 **Gmail** 时，为 Google 账号开启两步验证，生成 16 位应用专用密码。此方式适用于可创建应用专用密码的账号。[Google 应用专用密码入口](https://myaccount.google.com/apppasswords)
 - 绑定 **iCloud 或 Yahoo** 时，在对应账号的安全设置中，为邮件助手生成 App 专用密码或应用密码。
 
@@ -81,7 +97,7 @@ macOS 版启动时会自动同步已获授权的邮箱。某个邮箱需要授�
 
 在左侧选择账号或「全部收件箱」，点开邮件后选「回复」。写到一半可以关闭窗口，下次双击「草稿箱」中的邮件继续编辑。核对收件人和正文后点「发送回复」。
 
-需要 AI 时，打开「AI 设置…」，勾选「启用邮箱 AI 助手」，选择 DeepSeek 或阿里云百炼（中国内地）的模型，填入 API 密钥并保存。所选云端模型会使用相关邮件节选处理你的请求。
+AI 默认关闭。需要时，打开「AI 设置…」，勾选「启用邮箱 AI 助手」，选择 DeepSeek 或阿里云百炼（中国内地）的模型，填入 API 密钥并保存。所选云端模型会使用相关邮件节选处理你的请求。
 
 - 要**查信**，点侧栏「邮箱助手」，例如问「上周有哪些邮件需要我确认时间？」点击回答中的来源可打开原邮件。
 - 要**起草回复**，在「告诉 AI 怎么回」中直接输入你的要求，或按 **Tab** 采纳根据当前邮件生成的灰色建议。可以继续编辑，再点「按要求起草」。本地建议打开回复框即可使用，勾选「模型补全」还可以让所选模型结合来信续写你输入的开头。

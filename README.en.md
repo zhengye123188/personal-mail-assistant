@@ -1,10 +1,26 @@
-# Personal Mail Assistant
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/brand/maildesk-header-dark.svg">
+    <img src="./docs/brand/maildesk-header-light.svg" width="480" alt="MailDesk · Personal Mail Assistant">
+  </picture>
+</p>
 
-[简体中文](./README.md) · **English**
+<h3 align="center">One inbox for all your accounts.</h3>
 
-Read and reply to mail from QQ, NetEase (163, 126, and Yeah), Gmail, iCloud, and Yahoo in one desktop app. Connect an account to get started. AI features are off by default.
+<p align="center">
+  Read and reply to QQ, NetEase, Gmail, iCloud and Yahoo mail in Personal Mail Assistant.<br>
+  Turn on AI when you want help finding a message, drafting a reply or tracking a deadline.
+</p>
 
-## Download v0.2.0
+<p align="center">
+  <a href="https://github.com/zhengye123188/personal-mail-assistant/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-2453E8?style=flat-square" alt="View the v0.2.0 release"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-475569?style=flat-square" alt="MIT License"></a>
+  <a href="#download-an-installer"><img src="https://img.shields.io/badge/download-macOS%20%2F%20Windows-35618A?style=flat-square" alt="Download a macOS or Windows installer"></a>
+</p>
+
+<p align="center"><a href="./README.md" lang="zh-CN">简体中文</a> · <strong>English</strong></p>
+
+## Download an installer
 
 | Computer | System requirements | Installer |
 | --- | --- | --- |
@@ -69,7 +85,7 @@ To build the Mac app from source, install the dependencies above and run the fol
 
 Click **添加邮箱账户** (Add email account) in the lower-left corner. For an address like `name@gmail.com`, enter `name` and select `@gmail.com` from the menu, or paste the full address.
 
-- **QQ and NetEase.** Enable IMAP/SMTP in your provider’s webmail settings and generate a client authorization code.
+- **QQ and NetEase (163, 126, and Yeah).** Enable IMAP/SMTP in your provider’s webmail settings and generate a client authorization code.
 - **Gmail.** Enable 2-Step Verification and generate a 16-character app password if your Google account supports app passwords. [Google App Passwords](https://myaccount.google.com/apppasswords)
 - **iCloud and Yahoo.** Generate an app-specific password in your account’s security settings.
 
@@ -81,7 +97,7 @@ On macOS, authorized accounts sync automatically at startup. If an account needs
 
 Select an account or **全部收件箱** (All inboxes), open a message, and click **回复** (Reply). To resume an unfinished reply, double-click it in **草稿箱** (Drafts). Check the recipient and reply text before clicking **发送回复** (Send reply).
 
-To turn on AI, open **AI 设置…** (AI settings) and select **启用邮箱 AI 助手** (Enable email AI assistant). Choose a model from DeepSeek or Alibaba Cloud Model Studio (Chinese mainland), enter your API key, and save. The selected cloud model receives the relevant email excerpts when it processes your requests.
+AI features are off by default. To turn them on, open **AI 设置…** (AI settings) and select **启用邮箱 AI 助手** (Enable email AI assistant). Choose a model from DeepSeek or Alibaba Cloud Model Studio (Chinese mainland), enter your API key, and save. The selected cloud model receives the relevant email excerpts when it processes your requests.
 
 - **Find mail.** Open **邮箱助手** (Mail assistant) in the sidebar and ask, for example, “Which emails from last week asked me to confirm a time?” Click a source in the answer to open the original message.
 - **Draft a reply.** In **告诉 AI 怎么回** (Tell AI how to reply), enter your instructions or press **Tab** to accept the gray suggestion based on the incoming email. Edit the instructions, then click **按要求起草** (Draft from instructions). Local suggestions are available as soon as the reply window opens. Enable **模型补全** (Model completion) to have the selected model continue what you’ve started typing using the email as context.
