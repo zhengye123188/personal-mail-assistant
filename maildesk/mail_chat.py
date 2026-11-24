@@ -3,12 +3,21 @@
 import re
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from .models import DRAFT_CONTEXT_LIMIT, MailItem, MailQuery, ReplyDraft
 from .providers import MAIL_PROVIDERS
 from .reply_ai import ReplyAIError, structured_completion
 from .service import _needs_attention
+
+
+@dataclass(frozen=True)
+class DeadlineProposal:
+    source: MailItem
+    title: str
+    due_at: datetime
+    evidence: str
+    date_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,8 @@ class ChatTurn:
     draft_text: str = ""
     scope: tuple[str, ...] = ()
     draft_record: ReplyDraft | None = None
+    deadline_proposals: tuple[DeadlineProposal, ...] = ()
+    tools_used: tuple[str, ...] = ()
 
 
 _PLAN = """你是个人邮件助手的检索规划器。将当前问题编译为一个只读操作。输出 JSON 对象：

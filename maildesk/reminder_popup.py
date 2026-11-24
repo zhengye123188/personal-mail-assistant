@@ -10,7 +10,7 @@ from .mail_visuals import icon
 class ReminderPopup(QWidget):
     openRequested = Signal()
 
-    def __init__(self, owner=None):
+    def __init__(self, owner=None, *, deadlines=False):
         # A transient child of the reader would disappear when it is minimized.
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
@@ -22,6 +22,7 @@ class ReminderPopup(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         self._count = 0
+        self._deadlines = deadlines
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(10_000)
@@ -44,15 +45,16 @@ class ReminderPopup(QWidget):
         line.addWidget(badge)
         text = QVBoxLayout()
         text.setSpacing(3)
-        title = QLabel("个人邮件助手")
+        title = QLabel("截止待办提醒" if deadlines else "个人邮件助手")
         title.setObjectName("reminderTitle")
         text.addWidget(title)
         self.message = QLabel()
+        self.message.setTextFormat(Qt.TextFormat.PlainText)
         text.addWidget(self.message)
         line.addLayout(text, 1)
         view = QPushButton("查看")
         view.setObjectName("viewReminder")
-        view.setAccessibleName("查看待处理邮件")
+        view.setAccessibleName("查看截止待办" if deadlines else "查看待处理邮件")
         view.clicked.connect(self._open)
         line.addWidget(view)
         dismiss = QPushButton("×")
@@ -80,11 +82,27 @@ class ReminderPopup(QWidget):
             return
         self._count += count
         self.message.setText(f"新增 {self._count} 封待处理邮件")
+        self._present()
+
+    def notify_deadlines(self, tasks):
+        if not tasks:
+            return
+        self._count += len(tasks)
+        first = tasks[0]
+        title = " ".join(first.title.split())
+        title = self.message.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 230)
+        when = first.due_at.astimezone().strftime("%m/%d %H:%M")
+        suffix = f"（共 {self._count} 项）" if self._count > 1 else ""
+        self.message.setText(f"{title} · {when}{suffix}")
+        self._present()
+
+    def _present(self):
         self.adjustSize()
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         if screen is not None:
             area = screen.availableGeometry()
-            self.move(max(area.left(), area.right() - self.width() - 13), area.top() + 14)
+            top = area.bottom() - self.height() - 13 if self._deadlines else area.top() + 14
+            self.move(max(area.left(), area.right() - self.width() - 13), max(area.top(), top))
         self.show()
         self._timer.start()
 

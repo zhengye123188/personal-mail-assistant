@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +21,13 @@ from maildesk.reply_ai import ReplyAI
 from maildesk.service import CredentialAccessPaused, MailboxAuthorizationRequired, MailService
 from maildesk.ui import MainWindow
 from tests.mail_fixtures import MemoryVault, ACCOUNTS, FixtureClient, PNG
+
+
+def call_tool(name, **arguments):
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": name, "arguments": json.dumps(arguments)}},
+    ]}
 
 
 class DelayedInbox(FixtureClient):
@@ -56,7 +64,9 @@ class DesktopTestCase(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.client = DelayedInbox()
-        self.service = MailService(Path(directory.name) / "accounts.db", self.client, MemoryVault())
+        self.account_db = Path(directory.name) / "accounts.db"
+        self.vault = MemoryVault()
+        self.service = MailService(self.account_db, self.client, self.vault)
         settings = QSettings(str(Path(directory.name) / "models.ini"), QSettings.Format.IniFormat)
         self.enterContext(patch("maildesk.ui.QSettings", return_value=settings))
         self.enterContext(patch.dict(os.environ, DEEPSEEK_API_KEY="fixture", DASHSCOPE_API_KEY="fixture"))
@@ -130,10 +140,10 @@ class DesktopTestCase(unittest.TestCase):
         self.wait_until(lambda: self.window.model_settings is None)
 
     def model_replies(self, *values):
-        self.provider.side_effect = [
-            {"choices": [{"message": {"content": value if isinstance(value, str) else json.dumps(value)}}]}
-            for value in values
-        ]
+        messages = [value if isinstance(value, dict) and "tool_calls" in value
+                    else {"content": value if isinstance(value, str) else json.dumps(value)}
+                    for value in values]
+        self.provider.side_effect = [{"choices": [{"message": message}]} for message in messages]
 
     def open_chat(self):
         self.client.release_qq.set()
@@ -159,6 +169,57 @@ class DesktopTestCase(unittest.TestCase):
 
 
 class DesktopFlowTests(DesktopTestCase):
+    def test_confirmed_deadline_survives_restart_and_opens_source_with_ai_off(self):
+        account = ACCOUNTS[1]
+        deadline = (datetime.now(timezone.utc) + timedelta(days=2)).replace(second=0, microsecond=0)
+        day, clock = deadline.strftime("%Y-%m-%d"), deadline.strftime("%H:%M")
+        evidence = f"请在 {day} {clock} UTC 前提交报名表。"
+        self.client._examples["163"] = ((3, 2, "Reviewer", "报名截止", evidence),
+                                        *self.client._examples["163"][1:])
+        chat = self.open_chat()
+        chat.scope.setCurrentIndex(chat.scope.findData(account.address))
+        self.model_replies(
+            call_tool("search_mail", text="报名"), call_tool("read_mail", refs=["m1"]),
+            call_tool("propose_deadline", ref="m1", title="提交报名表", evidence=evidence,
+                      date_text=day, time_text=clock, zone_text="UTC"),
+            {"parts": [{"text": "请核对报名截止时间。", "refs": ["m1"]}]},
+        )
+        turn = self.ask_chat(chat, "报名邮件的截止时间是什么？帮我设置提醒。")
+        self.assertEqual(turn.deadline_proposals[0].source.account, account.address)
+        store = self.service.agent_store
+        self.assertFalse(store.list_tasks(ACCOUNTS))
+        chat.findChild(QPushButton, "confirmDeadline").click()
+        task, = store.list_tasks([account])
+        self.assertEqual((task.due_at, task.evidence), (deadline, evidence))
+        self.assertFalse(store.list_tasks([ACCOUNTS[0]]))
+        self.assertIsNone(self.window.deadline_popup)
+        self.set_ai_enabled(False)
+        self.assertTrue(self.window.close())
+        self.window.deleteLater()
+
+        # Simulate reopening shortly before the deadline and a new SQLite connection.
+        self.service = MailService(self.account_db, self.client, self.vault)
+        claim = self.service.agent_store.claim_due
+        with patch.object(self.service.agent_store, "claim_due",
+                          side_effect=lambda scope: claim(scope, now=deadline - timedelta(minutes=5))):
+            self.window = MainWindow(self.service)
+        self.window.show()
+        popup = self.window.deadline_popup
+        self.assertIsNotNone(popup)
+        self.assertIn(task.title, popup.message.text())
+        popup.findChild(QPushButton, "viewReminder").click()
+        chat = self.window.chat_dialog
+        self.assertEqual(chat.tasks.list.count(), 1)
+        chat.tasks.open_source.click()
+        self.wait_until(lambda: not self.window.jobs)
+        self.assertEqual(self.window.active_address, account.address)
+        self.assertIn(evidence, self.window.body.toPlainText())
+        self.window.deadlines_button.click()
+        chat.tasks.complete.click()
+        self.assertFalse(store.list_tasks(ACCOUNTS))
+        self.assertTrue(store.list_tasks(ACCOUNTS, include_completed=True)[0].completed)
+        self.assertEqual(self.provider.call_count, 4)
+
     def test_draft_folder_restores_an_offline_reply_after_restarting(self):
         qq = ACCOUNTS[0]
         self.client.release_qq.set()
@@ -444,8 +505,8 @@ class DesktopFlowTests(DesktopTestCase):
         qq, netease = ACCOUNTS
         chat = self.open_chat()
         self.model_replies(
-            {"action": "search"}, {"parts": [{"text": "两封邮件需要确认。", "sources": [1, 2]}]},
-            {"action": "draft"}, "请问设计评审会议在哪里举行？",
+            call_tool("search_mail"), {"parts": [{"text": "两封邮件需要确认。", "refs": ["m1", "m2"]}]},
+            call_tool("prepare_draft", ref="1:2"), "请问设计评审会议在哪里举行？",
             {"kind": "answer", "answer": "对方请你确认评审时间。"},
             {"kind": "draft", "draft": "周三不方便参加，感谢邀请。"},
             {"kind": "draft", "draft": "周四上午十点见，请带蓝色样稿。"},
@@ -503,10 +564,10 @@ class DesktopFlowTests(DesktopTestCase):
     def test_chat_drafts_save_before_editing_and_preserve_later_manual_changes(self):
         chat = self.open_chat()
         self.model_replies(
-            {"action": "search"}, {"parts": [{"text": "以下邮件等待回复。", "sources": [1, 2]}]},
-            {"action": "draft"}, "收到下周的安排，我看看时间后再确认。",
-            {"action": "revise"}, "待确认时间。",
-            {"action": "revise"}, "我会确认时间后再回复。",
+            call_tool("search_mail"), {"parts": [{"text": "以下邮件等待回复。", "refs": ["m1", "m2"]}]},
+            call_tool("prepare_draft", ref="1:2"), "收到下周的安排，我看看时间后再确认。",
+            call_tool("prepare_draft", ref="2:1"), "待确认时间。",
+            call_tool("prepare_draft", ref="3:1"), "我会确认时间后再回复。",
         )
         self.ask_chat(chat, "最近有哪些邮件需要回复？")
         first = self.ask_chat(chat, "帮我回第二封")
@@ -537,9 +598,9 @@ class DesktopFlowTests(DesktopTestCase):
 
         chat = self.open_chat()
         self.model_replies(
-            {"action": "search"}, {"parts": [{"text": "以下邮件等待回复。", "sources": [1, 2]}]},
-            {"action": "draft"}, "收到下周的安排，我看看时间后再确认。",
-            {"action": "revise"}, "待确认时间。",
+            call_tool("search_mail"), {"parts": [{"text": "以下邮件等待回复。", "refs": ["m1", "m2"]}]},
+            call_tool("prepare_draft", ref="1:2"), "收到下周的安排，我看看时间后再确认。",
+            call_tool("prepare_draft", ref="2:1"), "待确认时间。",
         )
         self.ask_chat(chat, "最近有哪些邮件需要回复？")
         self.ask_chat(chat, "帮我回第二封")
@@ -568,8 +629,8 @@ class DesktopFlowTests(DesktopTestCase):
         self.show_mailbox("all")
         self.window.refresh_button.click()
         self.wait_until(lambda: not self.window.jobs)
-        self.model_replies({"action": "search", "text": "校样"},
-                           {"parts": [{"text": "有一封校样核对。", "sources": [1]}]})
+        self.model_replies(call_tool("search_mail", text="校样"),
+                           {"parts": [{"text": "有一封校样核对。", "refs": ["m1"]}]})
         result = self.ask_chat(chat, "关于校样的邮件有哪些？")
         self.assertEqual(len(result.sources), 1, result.answer)
         target = result.sources[0]

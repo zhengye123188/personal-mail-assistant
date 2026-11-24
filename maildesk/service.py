@@ -8,6 +8,7 @@ import time
 from concurrent.futures import Future
 from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
+from functools import cached_property
 from pathlib import Path
 from threading import Event, RLock
 from uuid import uuid4
@@ -162,6 +163,7 @@ def _account(provider: str, address: str) -> Account:
 class MailService:
     def __init__(self, db_path: Path, client, vault):
         self._db_path = Path(db_path)
+        self.agent_store_path = self._db_path.with_suffix(".agent.sqlite3")
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._client = client
         self._vault = vault
@@ -207,6 +209,11 @@ class MailService:
                 )
             """)
             db.commit()
+
+    @cached_property
+    def agent_store(self):
+        from .agent_store import AgentStore
+        return AgentStore(self.agent_store_path)
 
     def _connect(self):
         # SQLite connections belong to the thread that created them.

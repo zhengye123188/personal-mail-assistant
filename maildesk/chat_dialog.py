@@ -1,12 +1,13 @@
-"""Mailbox conversation window with in-memory history and actionable sources."""
+"""Scoped mailbox conversations, source-backed reminders and local preferences."""
 
 from concurrent.futures import CancelledError
+from sqlite3 import Error as DatabaseError
 from threading import Event
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
-    QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 from shiboken6 import isValid
 
@@ -90,12 +91,16 @@ class ChatDialog(QDialog):
     compose_reply = Signal(object, str)
     draft_ready = Signal(object, str)
 
-    def __init__(self, parent=None, *, accounts, model_description, ask, run):
+    tasks_changed = Signal()
+
+    def __init__(self, parent=None, *, accounts, model_description, ask, run, store=None):
         super().__init__(parent)
         self.setObjectName("chatDialog")
         self.setWindowTitle("邮箱助手")
         self.resize(650, 660)
         self.setMinimumSize(390, 420)
+        self._store = store
+        self.pages = None
         self._run = run
         self._ask = ask
         self._conversation_id = 0
@@ -122,7 +127,14 @@ class ChatDialog(QDialog):
             QPushButton#chatSource:hover, QPushButton#chatSuggestion:hover { background: #edf4fc; }
             QPushButton#chatSubmit:enabled { background: #087af2; color: white; border: 0; border-radius: 8px; padding: 6px 14px; }
             QPushButton#chatReset, QPushButton#chatCompose { background: #edf3fa; color: #1767a9; border: 0; border-radius: 7px; padding: 6px 10px; }
-            QLabel#chatStatus { color: #646470; }
+            QLabel#chatStatus, QLabel#agentHelp { color: #646470; }
+            QTabWidget::pane { border: none; border-top: 1px solid #e6e6eb; }
+            QTabBar::tab { padding: 7px 17px; color: #616875; background: white; }
+            QTabBar::tab:selected { color: #1767a9; border-bottom: 2px solid #337fc0; }
+            QTabBar::tab:hover { background: #f0f5fa; }
+            QListWidget#agentTasks { border: 1px solid #e2e5e9; border-radius: 6px; background: white; }
+            QListWidget#agentTasks::item { padding: 7px 8px; }
+            QListWidget#agentTasks::item:selected { background: #edf4fd; color: #184471; }
         """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 14)
@@ -130,16 +142,16 @@ class ChatDialog(QDialog):
         top = QHBoxLayout()
         top.setContentsMargins(18, 13, 18, 10)
         self.scope = QComboBox()
-        self.scope.setAccessibleName("查询邮箱，切换会开始新对话")
-        self.scope.setToolTip("切换查询邮箱会开始新对话")
+        self.scope.setAccessibleName("查询邮箱范围")
+        self.scope.setToolTip("切换此范围的对话和待办")
         self.scope.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         scope_label = QLabel("查询范围")
         scope_label.setObjectName("chatScopeLabel")
         scope_label.setBuddy(self.scope)
         top.addWidget(scope_label)
         top.addWidget(self.scope, 1)
-        self.new_chat = _button("新对话", "chatReset")
-        self.new_chat.setToolTip("清空本次对话并重新开始")
+        self.new_chat = _button("清除对话" if store is not None else "新对话", "chatReset")
+        self.new_chat.setToolTip("清除当前查询范围的对话记忆")
         top.addWidget(self.new_chat)
         layout.addLayout(top)
         line = QFrame()
@@ -147,6 +159,24 @@ class ChatDialog(QDialog):
         line.setFixedHeight(1)
         layout.addWidget(line)
 
+        if store is not None:
+            from .agent_widgets import PreferencePage, TaskPage
+
+            self.pages = QTabWidget()
+            self.pages.setDocumentMode(True)
+            layout.addWidget(self.pages, 1)
+            conversation = QWidget()
+            self.pages.addTab(conversation, "对话")
+            self.tasks = TaskPage(store)
+            self.tasks.open_mail.connect(self.open_mail)
+            self.tasks.changed.connect(self.tasks_changed)
+            self.pages.addTab(self.tasks, "待办")
+            self.prefs = PreferencePage(store)
+            self.prefs.changed.connect(self.tasks_changed)
+            self.pages.addTab(self.prefs, "偏好")
+            self.pages.currentChanged.connect(self._page_changed)
+            layout = QVBoxLayout(conversation)
+            layout.setContentsMargins(0, 0, 0, 0)
         self.stack = QStackedWidget()
         layout.addWidget(self.stack, 1)
         welcome = QWidget()
@@ -163,7 +193,10 @@ class ChatDialog(QDialog):
         intro.addWidget(heading, 0, Qt.AlignmentFlag.AlignCenter)
         intro.addSpacing(8)
         self.suggestions = []
-        for question in ("最近有哪些邮件需要回复？", "总结最近一周的来信"):
+        questions = ["最近有哪些邮件需要回复？", "总结最近一周的来信"]
+        if store is not None:
+            questions.append("找出最近一周邮件中的截止日期，帮我整理成待办")
+        for question in questions:
             suggestion = _button(question, "chatSuggestion")
             suggestion.clicked.connect(lambda checked=False, q=question: self._send(q))
             intro.addWidget(suggestion, 0, Qt.AlignmentFlag.AlignCenter)
@@ -207,7 +240,7 @@ class ChatDialog(QDialog):
         bottom.addWidget(composer)
         layout.addLayout(bottom)
 
-        self.new_chat.clicked.connect(self.reset)
+        self.new_chat.clicked.connect(self._clear_history)
         self.scope.currentIndexChanged.connect(self.reset)
         self.input.textChanged.connect(self._update_controls)
         self.input.submitted.connect(self._submit)
@@ -226,7 +259,42 @@ class ChatDialog(QDialog):
         self.scope.setCurrentIndex(max(0, self.scope.findData(previous)))
         self.scope.blockSignals(False)
         self._ask = ask
-        self.model_label.setText(f"提问时，问题与相关邮件节选将交给{model_description}。")
+        self.model_label.setText(f"提问时，问题、偏好和相关邮件节选将交给{model_description}。"
+                                 if ask else "启用 AI 后可在这里查信、总结和提取待办。")
+        self.reset()
+
+    def _scope_addresses(self):
+        selected = self.scope.currentData()
+        return tuple(a.address for a in self._accounts if not selected or a.address == selected)
+
+    def show_tasks(self, account=None):
+        if self.pages is not None:
+            if account is not None:
+                index = self.scope.findData(account)
+                if index >= 0:
+                    self.scope.setCurrentIndex(index)
+            if self.pages.currentWidget() is self.tasks:
+                self.tasks.refresh()
+            else:
+                self.pages.setCurrentWidget(self.tasks)
+
+    def show_conversation(self):
+        if self.pages is not None:
+            self.pages.setCurrentIndex(0)
+
+    def _page_changed(self, index):
+        self.new_chat.setVisible(index == 0)
+        self.scope.setEnabled(self.pages.currentWidget() is not self.prefs)
+        if self.pages.currentWidget() is self.tasks:
+            self.tasks.refresh()
+
+    def _clear_history(self):
+        if self._store is not None:
+            try:
+                self._store.clear_history(self._scope_addresses())
+            except (DatabaseError, OSError) as exc:
+                self._set_status(f"清除对话失败：{exc}")
+                return
         self.reset()
 
     @property
@@ -234,14 +302,17 @@ class ChatDialog(QDialog):
         return self._conversation_id
 
     def show_error(self, message):
-        self._set_status(str(message))
+        if self.pages is not None and self.pages.currentWidget() is self.tasks:
+            self.tasks.detail.setText(str(message))
+        else:
+            self._set_status(str(message))
 
     def disable(self):
         self._ask = None
-        self.reset()
+        self.reset(restore=False)
         self.close()
 
-    def reset(self):
+    def reset(self, *, restore=True):
         self._conversation_id += 1
         self._cancel()
         self.history.clear()
@@ -252,6 +323,20 @@ class ChatDialog(QDialog):
         self.input.clear()
         self.stack.setCurrentIndex(0)
         self._set_status("请先绑定邮箱。" if not self._accounts else "")
+        if self._store is not None:
+            scope = self._scope_addresses()
+            self.tasks.scope = scope
+            if self.pages.currentWidget() is self.tasks:
+                self.tasks.refresh()
+            if scope and restore:
+                try:
+                    self.history.extend(self._store.history(scope))
+                except (DatabaseError, OSError) as exc:
+                    self._set_status(f"读取对话记忆失败：{exc}")
+                for turn in self.history:
+                    self._add_question(turn.question)
+                    self._add_answer(turn)
+                self.stack.setCurrentIndex(int(bool(self.history)))
         self._update_controls()
 
     def _set_status(self, text):
@@ -336,6 +421,19 @@ class ChatDialog(QDialog):
             self.history.append(turn)
             self._add_answer(turn)
             self._set_status("")
+            if self._store is not None:
+                from .agent_store import HISTORY_LIMIT
+
+                try:
+                    self._store.save_turn(self._scope_addresses(), turn)
+                except (ValueError, DatabaseError, OSError) as exc:
+                    self._set_status(f"本轮对话仅保留在窗口中，保存失败：{exc}")
+                if len(self.history) > HISTORY_LIMIT:
+                    self.history.pop(0)
+                    for _ in range(2):
+                        widget = self.messages.takeAt(0).widget()
+                        widget.hide()
+                        widget.deleteLater()
             self._update_controls()
             if turn.draft_record is not None:
                 item = turn.draft_record.item
@@ -364,12 +462,25 @@ class ChatDialog(QDialog):
         column = QVBoxLayout(row)
         column.setContentsMargins(0, 0, 8, 3)
         column.setSpacing(6)
-        column.addWidget(_label("邮箱助手", name="chatRole"))
+        tool_names = {"search_mail": "检索邮件", "read_mail": "读取原文",
+                      "list_tasks": "查看待办", "propose_deadline": "提取截止日期",
+                      "prepare_draft": "起草回复"}
+        actions = dict.fromkeys(tool_names[key] for key in turn.tools_used if key in tool_names)
+        role = "邮箱助手" + ("  ·  " + "、".join(actions) if actions else "")
+        column.addWidget(_label(role, name="chatRole"))
         column.addWidget(_label(turn.answer, name="chatAnswer", selectable=True))
         for number, item in enumerate(turn.sources, 1):
             button = _SourceButton(number, item)
             button.clicked.connect(lambda checked=False, mail=item: self.open_mail.emit(mail))
             column.addWidget(button)
+        if self._store is not None and turn.deadline_proposals:
+            from .agent_widgets import DeadlineCard
+
+            for proposal in turn.deadline_proposals:
+                if proposal.source.account in self._scope_addresses():
+                    card = DeadlineCard(proposal, self._store)
+                    card.confirmed.connect(self.tasks_changed)
+                    column.addWidget(card)
         if turn.draft_item is not None:
             card = QFrame()
             card.setObjectName("chatDraftCard")

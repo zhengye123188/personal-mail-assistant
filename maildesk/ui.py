@@ -1,5 +1,6 @@
 """Chinese desktop interface for the personal mail assistant."""
 
+import sqlite3
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -19,7 +20,6 @@ from PySide6.QtWidgets import (
 
 from .chat_dialog import ChatDialog
 from .compose_assistant import ComposeTurn, compose_draft, compose_turn
-from .mail_chat import MailChat
 from .models import MailItem, ReplyDraft, ReplyEnvelope
 from .mail_visuals import MailDelegate, icon
 from .providers import MAIL_PROVIDERS, provider_for_address
@@ -382,9 +382,11 @@ class MainWindow(QMainWindow):
         bar.messageChanged.connect(lambda message: bar.setVisible(bool(message)))
         self.popup = ReminderPopup(self)
         self.popup.openRequested.connect(self._open_pending)
+        self.deadline_popup = None
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(60_000)
         self.reminder_timer.timeout.connect(self._poll_reminders)
+        self.reminder_timer.timeout.connect(self._poll_deadlines)
         self._load_accounts()
         self.reminder_timer.start()
 
@@ -455,6 +457,8 @@ class MainWindow(QMainWindow):
         self.image_download_stop.set()
         self.reminder_timer.stop()
         self.popup.hide()
+        if self.deadline_popup is not None:
+            self.deadline_popup.hide()
         super().closeEvent(event)
 
     def _build_sidebar(self):
@@ -479,10 +483,14 @@ class MainWindow(QMainWindow):
         self.chat_button = _button("邮箱助手", "mailChat")
         self.chat_button.setStyleSheet("QPushButton {color: #185997; background: #e2ecf7; border: none;"
                                        " border-radius: 7px; padding: 7px;} QPushButton:hover {background: #d7e6f7}")
-        self.chat_button.setToolTip("对话查信、总结来信或起草回复")
+        self.chat_button.setToolTip("跨邮箱查信、总结来信、提取截止日期或起草回复")
         self.chat_button.clicked.connect(self._open_chat)
         self.chat_button.setVisible(self.reply_model is not None)
         layout.addWidget(self.chat_button)
+        self.deadlines_button = _button("截止待办", "deadlineTasks")
+        self.deadlines_button.setToolTip("查看已确认的截止时间、原邮件和完成状态")
+        self.deadlines_button.clicked.connect(self._open_tasks)
+        layout.addWidget(self.deadlines_button)
         self.ai_settings_button = _button("AI 设置…", "aiSettings")
         self.ai_settings_button.setToolTip("设置邮箱助手、辅助回复及使用的模型")
         self.ai_settings_button.clicked.connect(self._open_model_settings)
@@ -809,6 +817,21 @@ class MainWindow(QMainWindow):
             self._run(lambda a=account: self.service.poll_pending(a), done, stop=self.stop_sync)
         self._list_state()
 
+    def _poll_deadlines(self):
+        # Ordinary inbox use never creates an agent database or contacts a model.
+        if self.closing or not self.accounts or not self.service.agent_store_path.is_file():
+            return
+        try:
+            tasks = self.service.agent_store.claim_due(self.accounts)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.statusBar().showMessage(f"截止提醒检查失败：{exc}", 10_000)
+            return
+        if tasks:
+            if self.deadline_popup is None:
+                self.deadline_popup = ReminderPopup(self, deadlines=True)
+                self.deadline_popup.openRequested.connect(self._open_tasks)
+            self.deadline_popup.notify_deadlines(tasks)
+
     def _open_pending(self):
         if self.isMinimized():
             self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
@@ -914,6 +937,7 @@ class MainWindow(QMainWindow):
         self._read_drafts()
         self._account_changed(self.account_list.currentItem())
         self._poll_reminders()
+        self._poll_deadlines()
 
     def _open_binding(self, account):
         if self.binding is not None:
@@ -1301,6 +1325,7 @@ class MainWindow(QMainWindow):
         model = self.reply_model
         self.chat_button.setVisible(model is not None)
         self.chat_button.setEnabled(bool(self.accounts))
+        self.deadlines_button.setVisible(bool(self.accounts))
         if self.chat_dialog is None:
             return
         if model is None:
@@ -1309,23 +1334,50 @@ class MainWindow(QMainWindow):
             self.chat_dialog = None
         else:
             self.chat_dialog.reconfigure(accounts=tuple(self.accounts), model_description=model.description,
-                                         ask=MailChat(self.service, model).ask)
+                                        ask=self._agent_ask())
 
-    def _open_chat(self):
-        if self.reply_model is None or not self.accounts:
+    def _agent_ask(self):
+        if self.reply_model is not None:
+            from .mail_agent import MailAgent
+            return MailAgent(self.service, self.reply_model, self.service.agent_store).ask
+        return None
+
+    def _present_chat(self, *, tasks=False):
+        if not self.accounts or (not tasks and self.reply_model is None):
             return
         if self.chat_dialog is None:
-            self.chat_dialog = ChatDialog(self, accounts=tuple(self.accounts), model_description=self.reply_model.description,
-                                         ask=MailChat(self.service, self.reply_model).ask, run=self._run)
+            try:
+                store = self.service.agent_store
+                self.chat_dialog = ChatDialog(
+                    self, accounts=tuple(self.accounts),
+                    model_description=self.reply_model.description if self.reply_model else "",
+                    ask=self._agent_ask(), run=self._run, store=store,
+                )
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.statusBar().showMessage(f"无法打开邮箱助手：{exc}")
+                return
             self.chat_dialog.open_mail.connect(self._open_chat_source)
             self.chat_dialog.compose_reply.connect(self._open_chat_draft)
             self.chat_dialog.draft_ready.connect(self._save_chat_draft)
+            self.chat_dialog.tasks_changed.connect(self._poll_deadlines)
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        if tasks:
+            self.chat_dialog.show_tasks(account="")
+        else:
+            self.chat_dialog.show_conversation()
         self.chat_dialog.show()
         self.chat_dialog.raise_()
         self.chat_dialog.activateWindow()
 
+    def _open_chat(self):
+        self._present_chat()
+
+    def _open_tasks(self):
+        self._present_chat(tasks=True)
+
     def _open_chat_source(self, item):
-        if self.reply_model is None:
+        if self.chat_dialog is None:
             return
         for index in range(self.account_list.count()):
             entry = self.account_list.item(index)

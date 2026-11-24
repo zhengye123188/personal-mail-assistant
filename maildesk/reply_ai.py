@@ -153,8 +153,7 @@ class ReplyAI:
         context = _draft_context(subject, body, instruction, previous_draft, conversation, prior_instructions)
         return complete_draft(self, _SYSTEM, context)
 
-    def complete(self, messages, *, json_response=False) -> str:
-        """Run an explicit user request on the configured provider."""
+    def _completion(self, messages, *, json_response=False, tools=None):
         if self.provider == "off":
             raise ReplyAIError("AI 已关闭，可在模型设置中选择服务和模型。")
         if self.model not in dict(MODELS.get(self.provider, ())):
@@ -164,7 +163,9 @@ class ReplyAI:
         if not key or not key.isascii() or not key.isprintable() or " " in key:
             raise ReplyAIError(f"请在模型设置中填写有效的 {PROVIDER_NAMES[self.provider]} API 密钥。")
         payload = {"model": self.model, "messages": messages, "stream": False,
-                   "max_tokens": 2048 if json_response else 1024}
+                   "max_tokens": 2048 if (json_response or tools) else 1024}
+        if tools:
+            payload["tools"] = tools
         if json_response:
             payload["response_format"] = {"type": "json_object"}
         if self.provider == "deepseek":
@@ -180,6 +181,38 @@ class ReplyAI:
         reason = first.get("finish_reason")
         if reason in ("length", "max_tokens"):
             raise ReplyAIError("模型达到输出长度限制，请缩短回复要求后重新生成。")
-        if reason and reason != "stop":
+        if reason and reason != "stop" and not (tools and reason == "tool_calls"):
             raise ReplyAIError("模型未完成草稿，请调整回复要求后重试。")
-        return _draft(message.get("content") if isinstance(message, dict) else None)
+        if not isinstance(message, dict):
+            raise ReplyAIError("模型返回的消息格式异常。")
+        return message
+
+    def complete(self, messages, *, json_response=False) -> str:
+        """Run an explicit user request on the configured provider."""
+        return _draft(self._completion(messages, json_response=json_response).get("content"))
+
+    def tool_step(self, messages, tools):
+        """Return only fields needed to continue an OpenAI-compatible tool conversation."""
+        message = self._completion(messages, tools=tools)
+        calls = message.get("tool_calls")
+        if calls is None:
+            return {"role": "assistant", "content": _draft(message.get("content"))}
+        if not isinstance(calls, list) or len(calls) > 8:
+            raise ReplyAIError("模型返回了无效的工具调用。")
+        if not calls:
+            return {"role": "assistant", "content": _draft(message.get("content"))}
+        normalized, ids = [], set()
+        for call in calls:
+            if not isinstance(call, dict) or call.get("type") != "function":
+                raise ReplyAIError("模型返回了未知的工具类型。")
+            ident, func = call.get("id"), call.get("function")
+            if (not isinstance(ident, str) or not 1 <= len(ident) <= 160 or ident in ids
+                    or not isinstance(func, dict) or not isinstance(func.get("name"), str)
+                    or not 1 <= len(func["name"]) <= 64 or not isinstance(func.get("arguments"), str)
+                    or len(func["arguments"]) > 4000):
+                raise ReplyAIError("模型返回了无效的工具参数。")
+            ids.add(ident)
+            normalized.append({"id": ident, "type": "function",
+                               "function": {"name": func["name"], "arguments": func["arguments"]}})
+        # Both configured providers run in non-thinking mode. Do not replay reasoning.
+        return {"role": "assistant", "content": "", "tool_calls": normalized}
