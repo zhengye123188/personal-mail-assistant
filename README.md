@@ -1,5 +1,7 @@
 # 个人邮件助手
 
+简体中文 · [English](./README.en.md)
+
 在一个桌面窗口里查看和回复 QQ、网易 163、126、Yeah、Gmail、iCloud 和 Yahoo 邮件。绑定邮箱即可使用，AI 助手默认关闭。
 
 **下载桌面版 v0.2.0**
