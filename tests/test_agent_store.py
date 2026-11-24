@@ -76,6 +76,75 @@ class AgentStoreTests(unittest.TestCase):
         self.assertLessEqual(len(turns[-1].answer), 1200)
         self.assertEqual(len(turns[-1].sources), 10)
 
+    def test_conversation_pages_keep_full_transcript_while_memory_stays_bounded(self):
+        first = self.store.start_conversation([self.a], ChatTurn("  日程\n 确认 ", "第一轮"))
+        second = self.store.start_conversation([self.a], ChatTurn("其他事项", "另一个会话"))
+        long_answer = "进展" * 900
+        for i in range(1, HISTORY_LIMIT + 2):
+            self.store.save_turn([self.a], ChatTurn(str(i), long_answer, (self.mail,) * 11), conversation_id=first)
+        reopened = AgentStore(self.path)
+        newest, other = reopened.list_conversations([self.a])
+        self.assertEqual((newest.id, newest.title, newest.turn_count), (first, "日程 确认", HISTORY_LIMIT + 2))
+        self.assertEqual((other.id, other.turn_count), (second, 1))
+        page = reopened.conversation_page([self.a], first)
+        older = reopened.conversation_page([self.a], first, offset=HISTORY_LIMIT)
+        self.assertEqual([turn.question for turn in older], ["  日程\n 确认 ", "1"])
+        self.assertEqual([turn.question for turn in page], [str(i) for i in range(2, HISTORY_LIMIT + 2)])
+        self.assertEqual((page[-1].answer, len(page[-1].sources)), (long_answer, 11))
+        self.assertEqual(reopened.conversation_page([self.a], first, offset=HISTORY_LIMIT * 2), ())
+        self.assertEqual(len(reopened.history([self.a], conversation_id=first)[-1].answer), 1200)
+        self.assertEqual(reopened.history([self.a], conversation_id=second)[0].question, "其他事项")
+        with self.assertRaises(ValueError):
+            reopened.conversation_page([self.a], first, offset=-1)
+
+    def test_deletion_is_scoped_cascades_and_late_answers_cannot_restore_it(self):
+        scope = [self.a, self.b]
+        former = self.store.start_conversation(scope, ChatTurn("审稿", "等待确认", (self.mail,)))
+        keep = self.store.start_conversation(scope, ChatTurn("旅行", "整理行程"))
+        task = self.store.add_task("审稿", self.due, self.mail)
+        self.assertEqual(self.store.list_conversations([self.b]), ())
+        self.assertEqual(self.store.history([self.b], conversation_id=former), ())
+        self.assertEqual(self.store.conversation_page([self.a], former), ())
+        self.assertFalse(self.store.delete_conversation([self.a], former))
+        with self.assertRaises(ValueError):
+            self.store.save_turn([self.a], ChatTurn("错发", "回复"), conversation_id=former)
+        self.assertTrue(self.store.delete_conversation(scope[::-1], former))
+        self.assertFalse(self.store.delete_conversation(scope, former))
+        self.assertEqual(self.store.list_tasks(scope), (task,))
+        self.assertEqual([c.id for c in self.store.list_conversations(scope)], [keep])
+        # A queued result can arrive after every old thread was deleted and another created.
+        self.store.delete_conversation(scope, keep)
+        new = self.store.start_conversation(scope, ChatTurn("新会话", "新答复"))
+        self.assertNotIn(new, (former, keep))
+        with self.assertRaises(ValueError):
+            self.store.save_turn(scope, ChatTurn("审稿", "迟到的回复"), conversation_id=former)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT DISTINCT conversation_id FROM conversation_turns").fetchall(), [(new,)])
+
+    def test_legacy_transcripts_migrate_once_during_concurrent_reopens(self):
+        legacy_path = self.path.with_name("legacy.sqlite3")
+        with closing(sqlite3.connect(legacy_path)) as db, db:
+            db.execute("""CREATE TABLE turns(id INTEGER PRIMARY KEY, scope TEXT NOT NULL,
+                          question TEXT NOT NULL, answer TEXT NOT NULL, sources TEXT NOT NULL)""")
+            db.executemany("INSERT INTO turns VALUES (?,?,?,?,?)", [
+                (2, '["a@qq.com"]', "旧问题一", "旧答复一", "[]"),
+                (4, '["b@163.com"]', "另一邮箱", "单独保留", "[]"),
+                (5, '["a@qq.com"]', "旧问题二", "旧答复二", "[]"),
+            ])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            opened = list(pool.map(lambda _: AgentStore(legacy_path), range(4)))
+        for store in opened:
+            migrated, = store.list_conversations([self.a])
+            self.assertEqual((migrated.title, migrated.turn_count), ("旧问题一", 2))
+            self.assertEqual([turn.answer for turn in store.conversation_page([self.a], migrated.id)],
+                             ["旧答复一", "旧答复二"])
+            separate, = store.list_conversations([self.b])
+            self.assertEqual((separate.title, separate.turn_count), ("另一邮箱", 1))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            thread_ids = list(pool.map(lambda n: store.save_turn([self.a], ChatTurn(str(n), "答")), range(12)))
+        self.assertEqual(set(thread_ids), {migrated.id})
+        self.assertEqual(store.list_conversations([self.a])[0].turn_count, 14)
+
     def test_confirmations_idempotent_per_source_and_scoped_completion(self):
         other_mail = replace(self.mail, account=self.b.address)
         first = self.store.add_task("Submit   form", self.due, self.mail, "周三 18 点前交表")

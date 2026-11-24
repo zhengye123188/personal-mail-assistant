@@ -1,17 +1,20 @@
 """Scoped mailbox conversations, source-backed reminders and local preferences."""
 
+from collections import OrderedDict
 from concurrent.futures import CancelledError
+from dataclasses import replace
 from sqlite3 import Error as DatabaseError
 from threading import Event
 
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
+    QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 from shiboken6 import isValid
 
+from .agent_store import HISTORY_LIMIT
 from .mail_visuals import icon, sender_display
 
 
@@ -127,6 +130,15 @@ class ChatDialog(QDialog):
         self._run = run
         self._ask = ask
         self._conversation_id = 0
+        self._thread_id = None
+        self._view_scope = ()
+        self._chosen = {}
+        self._inputs = {}
+        self._live_turns = OrderedDict()
+        self._threads = ()
+        self._turn_count = 0
+        self._offset = 0
+        self.conversation_bar = None
         self._pending = None
         self._question_row = None
         self._active_question = ""
@@ -184,11 +196,9 @@ class ChatDialog(QDialog):
         self.scope.setMinimumContentsLength(9)
         self.scope.setFixedHeight(29)
         top.addWidget(self.scope)
-        self.new_chat = _button("清除对话" if store is not None else "新对话", "chatReset")
-        self.new_chat.setToolTip("清除当前查询范围的对话记忆")
-
         if store is not None:
             from .agent_widgets import PreferencePage, TaskPage
+            from .conversation_bar import ConversationBar
 
             self.pages = QTabWidget()
             self.pages.setObjectName("agentWorkspace")
@@ -215,7 +225,29 @@ class ChatDialog(QDialog):
             self._fit_navigation()
             layout = QVBoxLayout(conversation)
             layout.setContentsMargins(0, 0, 0, 12)
+            layout.setSpacing(0)
+            self.conversation_bar = ConversationBar()
+            self.new_chat = self.conversation_bar.new_button
+            layout.addWidget(self.conversation_bar)
+            self.conversation_bar.selected.connect(self._select_thread)
+            self.conversation_bar.new_requested.connect(self._new_thread)
+            self.conversation_bar.delete_requested.connect(self._confirm_delete)
+            self.page_nav = QWidget()
+            nav = QHBoxLayout(self.page_nav)
+            nav.setContentsMargins(16, 3, 16, 0)
+            self.older_turns = _button("更早记录", "chatReset")
+            self.newer_turns = _button("较新记录", "chatReset")
+            self.page_label = _label("", name="chatRole")
+            self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            nav.addWidget(self.older_turns)
+            nav.addWidget(self.page_label, 1)
+            nav.addWidget(self.newer_turns)
+            self.older_turns.clicked.connect(lambda: self._show_page(self._offset + HISTORY_LIMIT))
+            self.newer_turns.clicked.connect(lambda: self._show_page(self._offset - HISTORY_LIMIT))
+            layout.addWidget(self.page_nav)
         else:
+            self.new_chat = _button("新对话", "chatReset")
+            self.new_chat.clicked.connect(self.reset)
             layout.addWidget(self.scope_bar, 0, Qt.AlignmentFlag.AlignRight)
         self.stack = QStackedWidget()
         layout.addWidget(self.stack, 1)
@@ -274,14 +306,14 @@ class ChatDialog(QDialog):
         actions = QHBoxLayout()
         self.model_label = _label("", name="chatModel")
         actions.addWidget(self.model_label, 1)
-        actions.addWidget(self.new_chat)
+        if store is None:
+            actions.addWidget(self.new_chat)
         self.send_button = _button("提问", "chatSubmit")
         actions.addWidget(self.send_button)
         box.addLayout(actions)
         bottom.addWidget(composer)
         layout.addLayout(bottom)
 
-        self.new_chat.clicked.connect(self._clear_history)
         self.scope.currentIndexChanged.connect(self.reset)
         self.scope.currentTextChanged.connect(self._scope_tooltip)
         self.input.textChanged.connect(self._update_controls)
@@ -353,14 +385,57 @@ class ChatDialog(QDialog):
         if self.pages.currentWidget() is self.tasks:
             self.tasks.refresh()
 
-    def _clear_history(self):
-        if self._store is not None:
-            try:
-                self._store.clear_history(self._scope_addresses())
-            except (DatabaseError, OSError) as exc:
-                self._set_status(f"清除对话失败：{exc}")
-                return
+    def _select_thread(self, thread_id):
+        self._chosen[self._view_scope] = thread_id
         self.reset()
+        self.input.setFocus()
+
+    def _refresh_conversation_bar(self):
+        self._turn_count = next((t.turn_count for t in self._threads if t.id == self._thread_id), 0)
+        self.conversation_bar.set_conversations(self._threads, self._thread_id)
+
+    def _new_thread(self):
+        if self._thread_id is None:
+            self._cancel()
+            self.input.clear()
+        self._select_thread(None)
+
+    def _confirm_delete(self):
+        scope, thread_id = self._view_scope, self._thread_id
+        thread = next((item for item in self._threads if item.id == thread_id), None)
+        if thread is None:
+            return
+        prompt = QMessageBox(self)
+        prompt.setObjectName("deleteConversationPrompt")
+        prompt.setWindowTitle("删除对话")
+        prompt.setTextFormat(Qt.TextFormat.PlainText)
+        prompt.setText(f"删除「{thread.title}」的全部聊天记录？")
+        prompt.setInformativeText("这段对话删除后无法恢复。")
+        cancel = prompt.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        delete = prompt.addButton("删除对话", QMessageBox.ButtonRole.DestructiveRole)
+        prompt.setDefaultButton(cancel)
+        prompt.setEscapeButton(cancel)
+
+        def finished():
+            confirmed = prompt.clickedButton() == delete
+            prompt.deleteLater()
+            if not confirmed:
+                return
+            try:
+                self._store.delete_conversation(scope, thread_id)
+            except (DatabaseError, OSError) as exc:
+                self._set_status(f"删除对话失败：{exc}")
+                return
+            key = (scope, thread_id)
+            self._inputs.pop(key, None)
+            self._live_turns.pop(key, None)
+            if self._chosen.get(scope) == thread_id:
+                self._chosen.pop(scope, None)
+            if self._view_scope == scope:
+                self.reset(remember=self._thread_id != thread_id)
+
+        prompt.finished.connect(finished)
+        prompt.open()
 
     @property
     def conversation_id(self):
@@ -377,31 +452,86 @@ class ChatDialog(QDialog):
         self.reset(restore=False)
         self.close()
 
-    def reset(self, *, restore=True):
-        self._conversation_id += 1
-        self._cancel()
-        self.history.clear()
+    def _clear_transcript(self):
         while self.messages.count():
             widget = self.messages.takeAt(0).widget()
             widget.hide()
             widget.deleteLater()
+
+    def _render_turns(self, turns):
+        self._clear_transcript()
+        for turn in turns:
+            self._add_question(turn.question)
+            self._add_answer(turn)
+        self.stack.setCurrentIndex(int(bool(turns)))
+
+    def _show_page(self, offset):
+        if self._store is None or self._thread_id is None or self._pending is not None:
+            return
+        try:
+            turns = (self._store.conversation_page(self._view_scope, self._thread_id, offset=offset)
+                     if offset else self.history)
+        except (DatabaseError, OSError, ValueError) as exc:
+            self._set_status(f"读取对话记录失败：{exc}")
+            return
+        self._offset = offset
+        self._render_turns(turns)
+        self._update_controls()
+        if offset:
+            QTimer.singleShot(0, self, lambda: self.scroll.verticalScrollBar().setValue(0))
+
+    def _remember_editor(self):
+        key = (self._view_scope, self._thread_id)
+        pending_text = self.input.toPlainText()
+        if pending_text.strip():
+            self._inputs[key] = pending_text
+        else:
+            self._inputs.pop(key, None)
+        # Keep recent interactive cards available when switching back during this run.
+        if self._thread_id is not None and any(t.deadline_proposals or t.draft_item for t in self.history):
+            self._live_turns[key] = tuple(self.history)
+            self._live_turns.move_to_end(key)
+            if len(self._live_turns) > 4:
+                self._live_turns.popitem(last=False)
+
+    def reset(self, *, restore=True, remember=True):
+        self._conversation_id += 1
+        self._cancel()
+        if self._store is not None and self._view_scope and remember and restore:
+            self._remember_editor()
+        self.history.clear()
+        self._clear_transcript()
         self.input.clear()
         self.stack.setCurrentIndex(0)
         self._set_status("请先绑定邮箱。" if not self._accounts else "")
         if self._store is not None:
-            scope = self._scope_addresses()
+            scope = tuple(sorted(self._scope_addresses()))
+            self._view_scope = scope
+            self._thread_id = None
+            self._threads = ()
+            self._offset = 0
             self.tasks.scope = scope
             if self.pages.currentWidget() is self.tasks:
                 self.tasks.refresh()
             if scope and restore:
                 try:
-                    self.history.extend(self._store.history(scope))
+                    self._threads = self._store.list_conversations(scope)
+                    newest = self._threads[0].id if self._threads else None
+                    selected = self._chosen.get(scope, newest)
+                    if selected is not None and all(t.id != selected for t in self._threads):
+                        selected = newest
+                    self._thread_id = self._chosen[scope] = selected
+                    key = (scope, selected)
+                    if selected is not None:
+                        turns = self._live_turns.pop(key, None)
+                        if turns is None:
+                            turns = self._store.conversation_page(scope, selected)
+                        self.history.extend(turns)
+                    self.input.setPlainText(self._inputs.pop(key, ""))
                 except (DatabaseError, OSError) as exc:
                     self._set_status(f"读取对话记忆失败：{exc}")
-                for turn in self.history:
-                    self._add_question(turn.question)
-                    self._add_answer(turn)
-                self.stack.setCurrentIndex(int(bool(self.history)))
+                self._render_turns(self.history)
+            self._refresh_conversation_bar()
         self._update_controls()
 
     def _set_status(self, text):
@@ -414,7 +544,17 @@ class ChatDialog(QDialog):
         self.input.setEnabled(available)
         self.send_button.setEnabled(available and (busy or bool(self.input.toPlainText().strip())))
         self.send_button.setText("停止" if busy else "提问")
-        self.new_chat.setVisible(bool(self.history or busy or self.input.toPlainText()))
+        if self.conversation_bar is None:
+            self.new_chat.setVisible(bool(self.history or busy or self.input.toPlainText()))
+        else:
+            self.new_chat.setEnabled(bool(self._accounts))
+            count = self._turn_count
+            self.page_nav.setVisible(count > HISTORY_LIMIT)
+            self.older_turns.setEnabled(not busy and self._offset + HISTORY_LIMIT < count)
+            self.newer_turns.setEnabled(not busy and self._offset > 0)
+            if count > HISTORY_LIMIT:
+                end = count - self._offset
+                self.page_label.setText(f"第 {max(1, end - HISTORY_LIMIT + 1)}–{end} 轮，共 {count} 轮")
         for suggestion in self.suggestions:
             suggestion.setEnabled(available and not busy)
 
@@ -451,8 +591,11 @@ class ChatDialog(QDialog):
         if len(question) > 2000:
             self._set_status("请将问题缩短至 2000 字以内。")
             return
+        if self._offset:
+            self._show_page(0)
         address = self.scope.currentData()
         accounts = tuple(a for a in self._accounts if not address or a.address == address)
+        scope, thread_id = self._view_scope, self._thread_id
         ask, history = self._ask, tuple(self.history)
         stop = Event()
         lifetime = self._destroyed
@@ -474,7 +617,7 @@ class ChatDialog(QDialog):
             return ask(question, accounts, history, cancelled=cancelled)
 
         def finished(turn, error):
-            if cancelled() or not isValid(self):
+            if cancelled() or not isValid(self) or self._pending is not stop:
                 return
             if error:
                 self._cancel()
@@ -487,12 +630,20 @@ class ChatDialog(QDialog):
             self._add_answer(turn)
             self._set_status("")
             if self._store is not None:
-                from .agent_store import HISTORY_LIMIT
-
                 try:
-                    self._store.save_turn(self._scope_addresses(), turn)
+                    if thread_id is None:
+                        self._thread_id = self._store.start_conversation(scope, turn)
+                        self._chosen[scope] = self._thread_id
+                    else:
+                        self._store.save_turn(scope, turn, conversation_id=thread_id)
                 except (ValueError, DatabaseError, OSError) as exc:
                     self._set_status(f"本轮对话仅保留在窗口中，保存失败：{exc}")
+                else:
+                    try:
+                        self._threads = self._store.list_conversations(scope)
+                        self._refresh_conversation_bar()
+                    except (DatabaseError, OSError) as exc:
+                        self._set_status(f"对话已保存，刷新会话列表失败：{exc}")
                 if len(self.history) > HISTORY_LIMIT:
                     self.history.pop(0)
                     for _ in range(2):
@@ -544,7 +695,7 @@ class ChatDialog(QDialog):
             for proposal in turn.deadline_proposals:
                 if proposal.source.account in self._scope_addresses():
                     card = DeadlineCard(proposal, self._store)
-                    card.confirmed.connect(self.tasks_changed)
+                    card.confirmed.connect(lambda p=proposal: self._deadline_added(p))
                     column.addWidget(card)
         if turn.draft_item is not None:
             card = QFrame()
@@ -559,6 +710,14 @@ class ChatDialog(QDialog):
             column.addWidget(card)
         self.messages.addWidget(row)
         self._scroll_to(row)
+
+    def _deadline_added(self, proposal):
+        # A confirmed card must not become editable again after switching threads.
+        for index, turn in enumerate(self.history):
+            if any(p is proposal for p in turn.deadline_proposals):
+                remaining = tuple(p for p in turn.deadline_proposals if p is not proposal)
+                self.history[index] = replace(turn, deadline_proposals=remaining)
+        self.tasks_changed.emit()
 
     def _scroll_to(self, row):
         def scroll():

@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QSpinBox, QTabBar, QVBoxLayout, QWidget,
 )
 
-from .agent_store import AgentPreferences, DETAIL_OPTIONS, HISTORY_LIMIT, LANGUAGE_OPTIONS
+from .agent_store import AgentPreferences, DETAIL_OPTIONS, LANGUAGE_OPTIONS
 from .mail_visuals import icon
 
 
@@ -173,7 +173,7 @@ class PreferencePage(QWidget):
         topics.addWidget(focus_label)
         topics.addWidget(self.focus)
         answers.addLayout(topics)
-        body.addWidget(_label(f"每个邮箱范围保留最近 {HISTORY_LIMIT} 轮问答，可在「对话」中清除。",
+        body.addWidget(_label("聊天记录按对话保存在本机，可在「对话」页切换或删除。",
                               "preferencesCaption", wrap=True))
         body.addSpacing(8)
 

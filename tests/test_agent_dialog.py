@@ -81,7 +81,7 @@ class AgentDialogTests(unittest.TestCase):
         self.assertEqual(offline.tasks.list.count(), 1)
         self.assertFalse(offline.tasks.complete.isEnabled())
 
-    def test_preference_save_reopen_and_scoped_history_clear(self):
+    def test_preference_save_reopen_and_new_chat_preserves_previous_history(self):
         d = self.dialog()
         self.send(d)
         d.scope.setCurrentIndex(d.scope.findData(self.qq.address))
@@ -104,7 +104,8 @@ class AgentDialogTests(unittest.TestCase):
         self.assertEqual(len(reopened.history), 1)
         self.assertFalse(reopened.findChildren(DeadlineCard))
         reopened.new_chat.click()
-        self.assertFalse(self.store.history((self.qq,)))
+        self.assertFalse(reopened.history)
+        self.assertEqual(len(self.store.history((self.qq,))), 1)
         self.assertEqual(len(self.store.history(self.accounts)), 1)
 
     def test_cancelled_reply_never_enters_memory_and_widget_count_is_bounded(self):
@@ -120,6 +121,20 @@ class AgentDialogTests(unittest.TestCase):
             self.send(d)
         self.assertEqual(len(d.history), HISTORY_LIMIT)
         self.assertEqual(d.messages.count(), 2 * HISTORY_LIMIT)
+
+    def test_unconfirmed_card_survives_switch_and_confirmed_card_stays_resolved(self):
+        d = self.dialog()
+        self.send(d)
+        bar = d.conversation_bar
+        thread = bar.selector.currentData()
+        bar.new_button.click()
+        bar.selector.setCurrentIndex(bar.selector.findData(thread))
+        card, = d.messages.itemAt(1).widget().findChildren(DeadlineCard)
+        card.confirm.click()
+        bar.new_button.click()
+        bar.selector.setCurrentIndex(bar.selector.findData(thread))
+        self.assertFalse(d.messages.itemAt(1).widget().findChildren(DeadlineCard))
+        self.assertEqual(len(self.store.list_tasks(self.accounts)), 1)
 
     def test_compact_navigation_and_empty_task_handoff(self):
         d = self.dialog()
