@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title">
-  <title id="title">MailDesk folded envelope</title>
-  <g transform="translate(5 16) scale(1.18)">
-    <path fill="#84CEFF" d="M1 40C2.6 35.3 5.7 33 11.2 31.6C22.9 28.5 33 27.1 44 25.7L7.1 43.6Z"/>
-    <path fill="#2453E8" d="M7 43.5L97.2.5C98.8-.2 100.1.8 99.7 2.6C96.8 16 91.1 24.3 80.3 31C65.7 39.6 53.1 50.9 38.4 59.1C36.6 60.2 34.9 60.1 33.2 59.1Z"/>
-    <path fill="#2453E8" d="M.7 45.2L32.8 69C34.3 70.2 35.7 70.3 37.1 69.2L68.7 44C70.3 42.7 71.7 43.4 71.7 45.4V70.6C71.7 76.7 67.5 80.7 61.4 80.7H10.9C4.7 80.7.4 76.7.4 70.7V48.1Z"/>
-  </g>
-</svg>

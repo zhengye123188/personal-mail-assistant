@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/brand/maildesk-header-dark.svg">
-    <img src="./docs/brand/maildesk-header-light.svg" width="480" alt="MailDesk · Personal Mail Assistant">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/zhengye123188/personal-mail-assistant/81267d5be9c2f538095c9ad7ab69d658a2146ace/docs/brand/maildesk-header-dark.svg">
+    <img src="https://raw.githubusercontent.com/zhengye123188/personal-mail-assistant/81267d5be9c2f538095c9ad7ab69d658a2146ace/docs/brand/maildesk-header-light.svg" width="480" alt="MailDesk · Personal Mail Assistant">
   </picture>
 </p>
 
@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zhengye123188/personal-mail-assistant/releases/tag/v0.2.0"><img src="./docs/brand/badge-release.png" width="100" height="20" alt="View the v0.2.0 release"></a>
-  <a href="./LICENSE"><img src="./docs/brand/badge-license.png" width="83" height="20" alt="MIT License"></a>
-  <a href="#download-an-installer"><img src="./docs/brand/badge-download.png" width="179" height="20" alt="Download a macOS or Windows installer"></a>
+  <a href="https://github.com/zhengye123188/personal-mail-assistant/releases/tag/v0.2.0"><img src="https://raw.githubusercontent.com/zhengye123188/personal-mail-assistant/81267d5be9c2f538095c9ad7ab69d658a2146ace/docs/brand/badge-release.png" width="100" height="20" alt="View the v0.2.0 release"></a>
+  <a href="./LICENSE"><img src="https://raw.githubusercontent.com/zhengye123188/personal-mail-assistant/81267d5be9c2f538095c9ad7ab69d658a2146ace/docs/brand/badge-license.png" width="83" height="20" alt="MIT License"></a>
+  <a href="#download-an-installer"><img src="https://raw.githubusercontent.com/zhengye123188/personal-mail-assistant/81267d5be9c2f538095c9ad7ab69d658a2146ace/docs/brand/badge-download.png" width="179" height="20" alt="Download a macOS or Windows installer"></a>
 </p>
 
 <p align="center"><a href="./README.md" lang="zh-CN">简体中文</a> · <strong>English</strong></p>
