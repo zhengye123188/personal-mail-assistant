@@ -2,7 +2,15 @@
 
 在一个桌面窗口里查看和回复 QQ、网易 163、126、Yeah、Gmail、iCloud 和 Yahoo 邮件。绑定邮箱即可使用，AI 助手默认关闭。
 
-**[下载 Mac 桌面版（DMG）](https://github.com/zhengye123188/personal-mail-assistant/releases/latest/download/PersonalMailAssistant-macOS-arm64.dmg)** · 适用于 Apple 芯片和 macOS 26 或更高版本。[查看版本记录](https://github.com/zhengye123188/personal-mail-assistant/releases)
+**下载桌面版 v0.2.0**
+
+| 电脑 | 系统要求 | 安装包 |
+| --- | --- | --- |
+| Mac · Apple 芯片（M 系列） | macOS 26 或更高版本 | [下载 Apple 芯片版 DMG](https://github.com/zhengye123188/personal-mail-assistant/releases/download/v0.2.0/PersonalMailAssistant-macOS-arm64.dmg) |
+| Mac · Intel 处理器 | macOS 26 或更高版本 | [下载 Intel 版 DMG](https://github.com/zhengye123188/personal-mail-assistant/releases/download/v0.2.0/PersonalMailAssistant-macOS-x86_64.dmg) |
+| Windows · 64 位 Intel 或 AMD 处理器 | Windows 10（1809 或更高版本）或 Windows 11 | [下载 Windows x64 安装程序](https://github.com/zhengye123188/personal-mail-assistant/releases/download/v0.2.0/PersonalMailAssistant-Windows-x64-Setup.exe) |
+
+Mac 用户可在苹果菜单的「关于本机」查看芯片或处理器。[查看版本记录](https://github.com/zhengye123188/personal-mail-assistant/releases)
 
 ## 项目功能
 
@@ -20,6 +28,8 @@
 **macOS 桌面应用**　打开下载的 DMG，把「个人邮件助手」拖到「应用程序」，再从「应用程序」中双击打开。安装包自带 Python 和图文阅读器。已使用源码版的用户，先正常退出旧窗口，再打开桌面版即可继续使用原有账号和草稿。
 
 此版本采用本地签名，尚未经过 Apple 公证。若首次打开时提示无法验证开发者，确认安装包来自本仓库后，可在「系统设置 → 隐私与安全性」中点「仍要打开」。[Apple 官方说明](https://support.apple.com/zh-cn/102445)
+
+**Windows 桌面应用**　运行上方的 x64 安装程序，按向导安装到当前用户。完成后从「开始」菜单打开「个人邮件助手」。安装包自带运行环境，当前版本未做 Windows 代码签名。
 
 **从源码运行**　建议使用 Python 3.11 或 3.12 和图形桌面环境。先克隆仓库并进入项目目录。
 
@@ -76,7 +86,7 @@ macOS 版启动时会自动同步已获授权的邮箱。某个邮箱需要授�
 
 ### 4. 在助手里跟进一件事
 
-要使用历史对话侧栏和截止待办，先退出已打开的桌面版，再按上方「从源码运行」的步骤启动 `main` 分支。已发布的 v0.1.2 安装包提供基础邮件和 AI 回复功能。
+桌面版 v0.2.0 已包含历史对话侧栏、截止待办和用户偏好。Mac 用户升级时先退出旧版，再把新版拖入「应用程序」并替换。若某个邮箱提示需要授权，点「授权并记住」完成系统确认。
 
 1. 点侧栏「邮箱助手」，选择一个邮箱或「全部收件箱」。可以先问「找出过去一周与报名有关的邮件」，再问「总结第二封，我要交什么材料、最晚什么时候交？」回答中的来源可以点回原信。
 2. 问「把有明确截止日期的事项列为待办建议」。逐项核对引用原文、事项和本地截止时间，必要时调整，再点「确认并添加提醒」。原文缺少时区时按本机时间理解，只有日期时会注明预填当天 23:59。
