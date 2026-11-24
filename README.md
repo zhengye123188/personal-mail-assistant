@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zhengye123188/personal-mail-assistant/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-2453E8?style=flat-square" alt="查看 v0.2.0 发布说明"></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-475569?style=flat-square" alt="MIT 许可证"></a>
-  <a href="#下载安装包"><img src="https://img.shields.io/badge/download-macOS%20%2F%20Windows-35618A?style=flat-square" alt="下载 macOS 或 Windows 安装包"></a>
+  <a href="https://github.com/zhengye123188/personal-mail-assistant/releases/tag/v0.2.0"><img src="./docs/brand/badge-release.png" width="100" height="20" alt="查看 v0.2.0 发布说明"></a>
+  <a href="./LICENSE"><img src="./docs/brand/badge-license.png" width="83" height="20" alt="MIT 许可证"></a>
+  <a href="#下载安装包"><img src="./docs/brand/badge-download.png" width="179" height="20" alt="下载 macOS 或 Windows 安装包"></a>
 </p>
 
 <p align="center"><strong>简体中文</strong> · <a href="./README.en.md" lang="en">English</a></p>
